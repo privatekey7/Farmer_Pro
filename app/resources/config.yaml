@@ -1,0 +1,11 @@
+concurrency: 10
+language: ru
+log_level: INFO
+retry_attempts: 3
+retry_backoff: 2.0
+rpc_evm_default:
+- https://eth.llamarpc.com
+- https://bsc-dataseed.binance.org
+rpc_solana_default:
+- https://api.mainnet-beta.solana.com
+timeout: 30
