@@ -41,7 +41,7 @@ Wait for everything to download — this takes 1–3 minutes.
 **5. Launch the application**
 
 ```
-python -m app.main
+python main.py
 ```
 
 The FarmerPro window will open.

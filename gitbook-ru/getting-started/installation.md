@@ -41,7 +41,7 @@ pip install -r requirements.txt
 **5. Запусти программу**
 
 ```
-python -m app.main
+python main.py
 ```
 
 Откроется окно FarmerPro.
