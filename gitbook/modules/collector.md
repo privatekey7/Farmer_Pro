@@ -25,6 +25,10 @@ Automatically consolidates all assets from wallets and transfers them to a singl
 | **Slippage** | Allowed price deviation during swap (%) | 3% |
 | **Pause between wallets** | Random delay to avoid bot detection | 60–180 sec |
 | **Send to exchange** | Enables the exchange transfer step | off |
+
+{% hint style="danger" %}
+Before enabling **Send to exchange**, manually verify that your exchange accepts deposits of the target network's native token. For example, if the target chain is Arbitrum — make sure the exchange accepts **ETH on Arbitrum**. Sending to an unsupported network may result in permanent loss of funds.
+{% endhint %}
 | **Pause before sending** | Wait after bridging to the target network | 60 sec |
 
 ## How to Run
