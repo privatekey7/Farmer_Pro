@@ -4,11 +4,12 @@ from dataclasses import dataclass
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QLabel, QLineEdit, QPushButton, QFileDialog,
+    QLabel, QLineEdit, QFileDialog, QPushButton,
     QCheckBox, QDoubleSpinBox, QSpinBox, QScrollArea, QFrame,
 )
 
 from app.ui.widgets.chain_picker import ChainPickerWidget
+from app.ui.widgets.drop_zone import DropZone
 
 from app.core.models import ProxyConfig
 from app.storage.parsers import parse_wallets, parse_proxies, parse_lines
@@ -59,34 +60,20 @@ class CollectorConfigWidget(QWidget):
         self._lbl_files_header = QLabel()
         layout.addWidget(self._lbl_files_header)
 
-        wallet_row = QHBoxLayout()
-        self._lbl_wallets = QLabel()
-        wallet_row.addWidget(self._lbl_wallets)
-        self._wallet_path = QLineEdit()
-        self._wallet_path.setPlaceholderText("private_keys.txt")
-        self._wallet_path.setReadOnly(True)
-        wallet_row.addWidget(self._wallet_path)
-        self._btn_browse_wallets = QPushButton()
-        self._btn_browse_wallets.clicked.connect(self._browse_wallets)
-        wallet_row.addWidget(self._btn_browse_wallets)
-        layout.addLayout(wallet_row)
-        self._wallet_status = QLabel()
-        layout.addWidget(self._wallet_status)
+        self._wallet_drop = DropZone(
+            label=tr("wallets_label"),
+            placeholder="private_keys.txt",
+        )
+        self._wallet_drop.file_dropped.connect(self._on_wallet_file)
+        layout.addWidget(self._wallet_drop)
 
         # --- Прокси ---
-        proxy_row = QHBoxLayout()
-        self._lbl_proxy = QLabel()
-        proxy_row.addWidget(self._lbl_proxy)
-        self._proxy_path = QLineEdit()
-        self._proxy_path.setPlaceholderText("proxy.txt")
-        self._proxy_path.setReadOnly(True)
-        proxy_row.addWidget(self._proxy_path)
-        self._btn_browse_proxies = QPushButton()
-        self._btn_browse_proxies.clicked.connect(self._browse_proxies)
-        proxy_row.addWidget(self._btn_browse_proxies)
-        layout.addLayout(proxy_row)
-        self._proxy_status = QLabel()
-        layout.addWidget(self._proxy_status)
+        self._proxy_drop = DropZone(
+            label=tr("proxy_label"),
+            placeholder="proxy.txt",
+        )
+        self._proxy_drop.file_dropped.connect(self._on_proxy_file)
+        layout.addWidget(self._proxy_drop)
 
         # --- Фильтры ---
         self._grp_filters = QGroupBox()
@@ -100,6 +87,7 @@ class CollectorConfigWidget(QWidget):
         self._min_token_usd.setValue(0.03)
         self._min_token_usd.setDecimals(2)
         self._min_token_usd.setFixedWidth(104)
+        self._min_token_usd.setToolTip(tr("min_value_tooltip"))
         min_row.addWidget(self._min_token_usd)
         min_row.addStretch()
         fg.addLayout(min_row)
@@ -119,6 +107,7 @@ class CollectorConfigWidget(QWidget):
         self._slippage.setValue(3.0)
         self._slippage.setDecimals(1)
         self._slippage.setFixedWidth(104)
+        self._slippage.setToolTip(tr("slippage_tooltip"))
         slippage_row.addWidget(self._slippage)
         slippage_row.addStretch()
         fg.addLayout(slippage_row)
@@ -144,6 +133,7 @@ class CollectorConfigWidget(QWidget):
         self._min_bridge_usd.setValue(0.03)
         self._min_bridge_usd.setDecimals(2)
         self._min_bridge_usd.setFixedWidth(104)
+        self._min_bridge_usd.setToolTip(tr("min_bridge_tooltip"))
         min_bridge_row.addWidget(self._min_bridge_usd)
         min_bridge_row.addStretch()
         bg.addLayout(min_bridge_row)
@@ -161,12 +151,14 @@ class CollectorConfigWidget(QWidget):
         self._delay_min.setRange(0, 3600)
         self._delay_min.setValue(60)
         self._delay_min.setFixedWidth(86)
+        self._delay_min.setToolTip(tr("delay_min_tooltip"))
         delay_row.addWidget(self._delay_min)
         delay_row.addWidget(QLabel("—"))
         self._delay_max = QSpinBox()
         self._delay_max.setRange(0, 3600)
         self._delay_max.setValue(180)
         self._delay_max.setFixedWidth(86)
+        self._delay_max.setToolTip(tr("delay_max_tooltip"))
         delay_row.addWidget(self._delay_max)
         delay_row.addStretch()
         dg.addLayout(delay_row)
@@ -181,22 +173,13 @@ class CollectorConfigWidget(QWidget):
         self._send_to_exchange.toggled.connect(self._on_exchange_toggled)
         eg.addWidget(self._send_to_exchange)
 
-        sub_row = QHBoxLayout()
-        self._lbl_subaccounts = QLabel()
-        sub_row.addWidget(self._lbl_subaccounts)
-        self._sub_path = QLineEdit()
-        self._sub_path.setPlaceholderText("subaccounts.txt")
-        self._sub_path.setReadOnly(True)
-        self._sub_path.setEnabled(False)
-        sub_row.addWidget(self._sub_path)
-        self._sub_btn = QPushButton()
-        self._sub_btn.setEnabled(False)
-        self._sub_btn.clicked.connect(self._browse_subaccounts)
-        sub_row.addWidget(self._sub_btn)
-        eg.addLayout(sub_row)
-
-        self._sub_status = QLabel("")
-        eg.addWidget(self._sub_status)
+        self._sub_drop = DropZone(
+            label=tr("subaccounts_label"),
+            placeholder="subaccounts.txt",
+        )
+        self._sub_drop.file_dropped.connect(self._on_subaccount_file)
+        self._sub_drop.setEnabled(False)
+        eg.addWidget(self._sub_drop)
 
         delay_bridge_row = QHBoxLayout()
         self._lbl_after_bridge_delay = QLabel()
@@ -206,6 +189,7 @@ class CollectorConfigWidget(QWidget):
         self._delay_after_bridge.setValue(60)
         self._delay_after_bridge.setFixedWidth(86)
         self._delay_after_bridge.setEnabled(False)
+        self._delay_after_bridge.setToolTip(tr("after_bridge_delay_tooltip"))
         delay_bridge_row.addWidget(self._delay_after_bridge)
         delay_bridge_row.addStretch()
         eg.addLayout(delay_bridge_row)
@@ -235,10 +219,8 @@ class CollectorConfigWidget(QWidget):
 
     def retranslate_ui(self) -> None:
         self._lbl_files_header.setText(tr("files_header"))
-        self._lbl_wallets.setText(tr("wallets_label"))
-        self._btn_browse_wallets.setText(tr("browse_btn"))
-        self._lbl_proxy.setText(tr("proxy_label"))
-        self._btn_browse_proxies.setText(tr("browse_btn"))
+        self._wallet_drop.set_label(tr("wallets_label"))
+        self._proxy_drop.set_label(tr("proxy_label"))
         self._grp_filters.setTitle(tr("filters_group"))
         self._lbl_min_value.setText(tr("min_value_label"))
         self._lbl_exclude_chains.setText(tr("exclude_chains_label"))
@@ -250,76 +232,49 @@ class CollectorConfigWidget(QWidget):
         self._lbl_delay_between_wallets.setText(tr("delay_between_wallets_label"))
         self._grp_exchange.setTitle(tr("exchange_group"))
         self._send_to_exchange.setText(tr("send_to_exchange_checkbox"))
-        self._lbl_subaccounts.setText(tr("subaccounts_label"))
-        self._sub_btn.setText(tr("browse_btn"))
+        self._sub_drop.set_label(tr("subaccounts_label"))
         self._lbl_after_bridge_delay.setText(tr("after_bridge_delay_label"))
         self._grp_export.setTitle(tr("export_group"))
         self._btn_csv.setText(tr("save_csv"))
         self._btn_json.setText(tr("save_json"))
         self._btn_xlsx.setText(tr("save_xlsx"))
 
-        # Re-apply status labels only if they show the "not loaded" default
-        if self._wallet_status.text() == "" or not self._wallets:
-            if not self._wallets:
-                self._wallet_status.setText(tr("file_not_loaded"))
-        if self._proxy_status.text() == "" or not self._proxies:
-            if not self._proxies:
-                self._proxy_status.setText(tr("file_not_loaded"))
-
     # --- Загрузка файлов ---
 
-    def _browse_wallets(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("select_wallets_file"), "", "Text files (*.txt);;All files (*)"
-        )
-        if not path:
-            return
+    def _on_wallet_file(self, path: str) -> None:
         try:
             parsed = parse_wallets(path)
             self._wallets = [w for w in parsed if w["type"] in ("private_key", "mnemonic")]
-            self._wallet_path.setText(path)
-            self._wallet_status.setText(tr("n_wallets_loaded").format(n=len(self._wallets)))
+            self._wallet_drop.set_status(tr("n_wallets_loaded").format(n=len(self._wallets)))
             self._check_wallet_subaccount_match()
         except Exception as e:
             self._wallets = []
-            self._wallet_status.setText(tr("error_fmt").format(e=e))
+            self._wallet_drop.set_status(tr("error_fmt").format(e=e))
 
-    def _browse_proxies(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("select_proxy_file"), "", "Text files (*.txt);;All files (*)"
-        )
-        if not path:
-            return
+    def _on_proxy_file(self, path: str) -> None:
         try:
             self._proxies = parse_proxies(path)
-            self._proxy_path.setText(path)
-            self._proxy_status.setText(tr("n_proxies_loaded").format(n=len(self._proxies)))
+            self._proxy_drop.set_status(tr("n_proxies_loaded").format(n=len(self._proxies)))
         except Exception as e:
             self._proxies = []
-            self._proxy_status.setText(tr("error_fmt").format(e=e))
+            self._proxy_drop.set_status(tr("error_fmt").format(e=e))
 
-    def _browse_subaccounts(self) -> None:
+    def _on_subaccount_file(self, path: str) -> None:
         import re
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("select_subaccounts_file"), "", "Text files (*.txt);;All files (*)"
-        )
-        if not path:
-            return
         try:
             lines = parse_lines(path)
             invalid = [l for l in lines if not re.fullmatch(r"0x[0-9a-fA-F]{40}", l)]
             if invalid:
                 self._subaccounts = []
-                self._sub_status.setText(
+                self._sub_drop.set_status(
                     tr("error_fmt").format(e=f"Invalid EVM addresses: {', '.join(invalid[:3])}{'…' if len(invalid) > 3 else ''}")
                 )
                 return
             self._subaccounts = lines
-            self._sub_path.setText(path)
             self._check_wallet_subaccount_match()
         except Exception as e:
             self._subaccounts = []
-            self._sub_status.setText(tr("error_fmt").format(e=e))
+            self._sub_drop.set_status(tr("error_fmt").format(e=e))
 
     def _check_wallet_subaccount_match(self) -> None:
         """Показывает предупреждение если кол-во кошельков != субаккаунтов."""
@@ -328,16 +283,15 @@ class CollectorConfigWidget(QWidget):
         w = len(self._wallets)
         s = len(self._subaccounts)
         if w == 0 or s == 0:
-            self._sub_status.setText("")
+            self._sub_drop.set_status("")
             return
         if w != s:
-            self._sub_status.setText(tr("wallets_subaccounts_mismatch").format(w=w, s=s))
+            self._sub_drop.set_status(tr("wallets_subaccounts_mismatch").format(w=w, s=s))
         else:
-            self._sub_status.setText(tr("n_subaccounts_loaded").format(s=s))
+            self._sub_drop.set_status(tr("n_subaccounts_loaded").format(s=s))
 
     def _on_exchange_toggled(self, checked: bool) -> None:
-        self._sub_path.setEnabled(checked)
-        self._sub_btn.setEnabled(checked)
+        self._sub_drop.setEnabled(checked)
         self._delay_after_bridge.setEnabled(checked)
         self._check_wallet_subaccount_match()
 

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QLabel, QLineEdit, QPushButton, QFileDialog,
-    QComboBox,
+    QLabel, QLineEdit, QFileDialog, QComboBox, QPushButton,
 )
 
+from app.ui.widgets.drop_zone import DropZone
 from app.core.models import ProxyConfig, Result
 from app.storage.parsers import parse_lines, parse_proxies
 from app.i18n import tr, i18n
@@ -28,36 +28,20 @@ class SvmBalanceConfigWidget(QWidget):
         layout.setSpacing(8)
 
         # --- Кошельки ---
-        wallet_row = QHBoxLayout()
-        self._lbl_wallets = QLabel()
-        wallet_row.addWidget(self._lbl_wallets)
-        self._wallet_path = QLineEdit()
-        self._wallet_path.setPlaceholderText("wallets.txt")
-        self._wallet_path.setReadOnly(True)
-        wallet_row.addWidget(self._wallet_path)
-        self._browse_wallets_btn = QPushButton()
-        self._browse_wallets_btn.clicked.connect(self._browse_wallets)
-        wallet_row.addWidget(self._browse_wallets_btn)
-        layout.addLayout(wallet_row)
-
-        self._wallet_status = QLabel(tr("file_not_loaded"))
-        layout.addWidget(self._wallet_status)
+        self._wallet_drop = DropZone(
+            label=tr("wallets_label"),
+            placeholder="wallets.txt",
+        )
+        self._wallet_drop.file_dropped.connect(self._on_wallet_file)
+        layout.addWidget(self._wallet_drop)
 
         # --- Прокси ---
-        proxy_row = QHBoxLayout()
-        self._lbl_proxy = QLabel()
-        proxy_row.addWidget(self._lbl_proxy)
-        self._proxy_path = QLineEdit()
-        self._proxy_path.setPlaceholderText("proxy.txt")
-        self._proxy_path.setReadOnly(True)
-        proxy_row.addWidget(self._proxy_path)
-        self._browse_proxies_btn = QPushButton()
-        self._browse_proxies_btn.clicked.connect(self._browse_proxies)
-        proxy_row.addWidget(self._browse_proxies_btn)
-        layout.addLayout(proxy_row)
-
-        self._proxy_status = QLabel(tr("file_not_loaded"))
-        layout.addWidget(self._proxy_status)
+        self._proxy_drop = DropZone(
+            label=tr("proxy_label"),
+            placeholder="proxy.txt",
+        )
+        self._proxy_drop.file_dropped.connect(self._on_proxy_file)
+        layout.addWidget(self._proxy_drop)
 
         # --- RPC URL ---
         self._lbl_rpc = QLabel()
@@ -98,47 +82,29 @@ class SvmBalanceConfigWidget(QWidget):
         i18n.language_changed.connect(self.retranslate_ui)
 
     def retranslate_ui(self) -> None:
-        self._lbl_wallets.setText(tr("wallets_label"))
-        self._lbl_proxy.setText(tr("proxy_label"))
-        self._browse_wallets_btn.setText(tr("browse_btn"))
-        self._browse_proxies_btn.setText(tr("browse_btn"))
+        self._wallet_drop.set_label(tr("wallets_label"))
+        self._proxy_drop.set_label(tr("proxy_label"))
         self._lbl_rpc.setText(tr("rpc_url_label"))
         self._export_group.setTitle(tr("export_group"))
         self._lbl_tokens.setText(tr("tokens_filter_label"))
-        if not self._wallets:
-            self._wallet_status.setText(tr("file_not_loaded"))
-        if not self._proxies:
-            self._proxy_status.setText(tr("file_not_loaded"))
 
     # --- File loading ---
 
-    def _browse_wallets(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("select_wallets_file"), "", "Text files (*.txt);;All files (*)"
-        )
-        if not path:
-            return
+    def _on_wallet_file(self, path: str) -> None:
         try:
             self._wallets = parse_lines(path)
-            self._wallet_path.setText(path)
-            self._wallet_status.setText(tr("n_addresses_loaded").format(n=len(self._wallets)))
+            self._wallet_drop.set_status(tr("n_addresses_loaded").format(n=len(self._wallets)))
         except Exception as e:
             self._wallets = []
-            self._wallet_status.setText(tr("error_fmt").format(e=e))
+            self._wallet_drop.set_status(tr("error_fmt").format(e=e))
 
-    def _browse_proxies(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("select_proxy_file"), "", "Text files (*.txt);;All files (*)"
-        )
-        if not path:
-            return
+    def _on_proxy_file(self, path: str) -> None:
         try:
             self._proxies = parse_proxies(path)
-            self._proxy_path.setText(path)
-            self._proxy_status.setText(tr("n_proxies_loaded").format(n=len(self._proxies)))
+            self._proxy_drop.set_status(tr("n_proxies_loaded").format(n=len(self._proxies)))
         except Exception as e:
             self._proxies = []
-            self._proxy_status.setText(tr("error_fmt").format(e=e))
+            self._proxy_drop.set_status(tr("error_fmt").format(e=e))
 
     # --- Accessors ---
 

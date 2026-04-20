@@ -89,4 +89,29 @@ TRANSLATIONS: dict[str, str] = {
 
     # SVM token filter
     "all_tokens": "All",
+    "empty_results_title": "No results yet",
+    "empty_results_subtitle": "Load a file and press Start to begin",
+    "empty_log_title": "Log is empty",
+    "empty_log_subtitle": "Activity will appear here during execution",
+
+    # Drop zone
+    "drop_hint": "Drop file here or click Browse",
+    "select_file": "Select file",
+
+    # Collector tooltips
+    "min_value_tooltip": "Tokens below this USD value will be skipped",
+    "slippage_tooltip": "Maximum allowed price slippage for swaps",
+    "delay_min_tooltip": "Minimum delay between processing wallets",
+    "delay_max_tooltip": "Maximum delay between processing wallets",
+    "after_bridge_delay_tooltip": "Wait time after bridge before next operation",
+    "min_bridge_tooltip": "Skip bridge if balance is below this USD value",
+
+    # Sidebar
+    "sidebar_collapse_tooltip": "Collapse sidebar",
+    "sidebar_expand_tooltip": "Expand sidebar",
+
+    "freeze_log_tooltip": "Freeze log (pause auto-scroll)",
+
+    "toast_finished_ok": "✓ Completed successfully",
+    "toast_finished_errors": "⚠ Completed with errors",
 }

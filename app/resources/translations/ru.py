@@ -89,4 +89,29 @@ TRANSLATIONS: dict[str, str] = {
 
     # SVM token filter
     "all_tokens": "Все",
+    "empty_results_title": "Результатов пока нет",
+    "empty_results_subtitle": "Загрузите файл и нажмите Старт",
+    "empty_log_title": "Лог пуст",
+    "empty_log_subtitle": "Активность появится здесь во время выполнения",
+
+    # Drop zone
+    "drop_hint": "Перетащите файл сюда или нажмите Обзор",
+    "select_file": "Выбрать файл",
+
+    # Collector tooltips
+    "min_value_tooltip": "Токены дешевле этой суммы в USD будут пропущены",
+    "slippage_tooltip": "Максимально допустимое проскальзывание цены при свапе",
+    "delay_min_tooltip": "Минимальная задержка между обработкой кошельков",
+    "delay_max_tooltip": "Максимальная задержка между обработкой кошельков",
+    "after_bridge_delay_tooltip": "Время ожидания после бриджа перед следующей операцией",
+    "min_bridge_tooltip": "Пропустить бридж если баланс ниже этой суммы в USD",
+
+    # Sidebar
+    "sidebar_collapse_tooltip": "Свернуть панель",
+    "sidebar_expand_tooltip": "Развернуть панель",
+
+    "freeze_log_tooltip": "Заморозить лог (пауза авто-прокрутки)",
+
+    "toast_finished_ok": "✓ Выполнено успешно",
+    "toast_finished_errors": "⚠ Выполнено с ошибками",
 }

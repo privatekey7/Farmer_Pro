@@ -61,7 +61,7 @@ def _check_token_sync(
                 # Definitive answer — do not retry
                 return Result(
                     item=token,
-                    status=ResultStatus.ERROR,
+                    status=ResultStatus.SKIP,
                     error=r.status.value,
                     data={"username": None, "account_status": r.status.value},
                 )

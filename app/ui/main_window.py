@@ -1,17 +1,11 @@
 from __future__ import annotations
+
 from PySide6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QHBoxLayout,
-    QVBoxLayout,
-    QSplitter,
-    QLabel,
-    QPushButton,
-    QStackedWidget,
-    QProgressBar,
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
+    QLabel, QPushButton, QStackedWidget, QProgressBar,
 )
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QShortcut, QKeySequence
 
 from app.core.base_module import BaseModule
 from app.core.module_registry import ModuleRegistry
@@ -20,7 +14,8 @@ from app.core.logger import Logger
 from app.core.task_runner import TaskRunner
 from app.ui.log_widget import LogWidget
 from app.ui.results_table import ResultsTable
-from app.ui.segmented_tabs import SegmentedModuleTabs
+from app.ui.sidebar import Sidebar
+from app.ui.widgets.toast import show_toast
 from app.i18n import i18n, tr
 
 
@@ -30,7 +25,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("FarmerPro")
         self.setMinimumSize(1200, 700)
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
-        # Стили применяются глобально в app/main.py через app.ui.theme (Apple dark)
 
         self._registry = registry
         self._task_runner = TaskRunner(self)
@@ -44,19 +38,17 @@ class MainWindow(QMainWindow):
         self._config_widgets: dict[int, QWidget] = {}
         self._results_cache: dict[int, list] = {}
 
-        # --- Toolbar (Apple-style) ---
-        self._app_title = QLabel("FarmerPro")
-        self._app_title.setObjectName("appTitle")
+        # ── Sidebar ──
+        self._sidebar = Sidebar(registry.get_modules())
+        self._sidebar.module_selected.connect(self._on_module_selected)
 
+        # ── Top toolbar (simplified — no tabs) ──
         self._start_btn = QPushButton()
         self._start_btn.setProperty("primary", True)
         self._stop_btn = QPushButton()
         self._stop_btn.setEnabled(False)
 
-        self._tabs = SegmentedModuleTabs(registry.get_modules())
-        self._tabs.module_selected.connect(self._on_module_selected)
-
-        # Language toggle buttons (EN | RU)
+        # Language toggle
         self._lang_en_btn = QPushButton("EN")
         self._lang_ru_btn = QPushButton("RU")
         self._lang_en_btn.setCheckable(True)
@@ -78,31 +70,24 @@ class MainWindow(QMainWindow):
         top_bar = QWidget()
         top_bar.setObjectName("topToolbar")
         top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(12, 10, 12, 10)
+        top_layout.setContentsMargins(12, 8, 12, 8)
         top_layout.setSpacing(10)
-
-        # Left: Start / Stop
         top_layout.addWidget(self._start_btn)
         top_layout.addWidget(self._stop_btn)
-
-        # Center tabs (true center via equal stretches)
-        top_layout.addStretch(1)
-        top_layout.addWidget(self._tabs, 0, Qt.AlignCenter)
-        top_layout.addStretch(1)
-
-        # Right: FAQ | EN | RU
+        top_layout.addStretch()
         top_layout.addWidget(self._faq_btn)
         top_layout.addWidget(self._lang_en_btn)
         top_layout.addWidget(self._lang_ru_btn)
 
-        # --- Progress row ---
+        # ── Progress ──
         self._progress_bar = QProgressBar()
         self._progress_bar.setTextVisible(False)
-        self._progress_bar.setFixedHeight(6)
-
+        self._progress_bar.setFixedHeight(4)
+        self._progress_bar.setObjectName("mainProgress")
         self._progress_label = QLabel("")
         self._progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._progress_label.setMinimumWidth(90)
+        self._progress_label.setObjectName("progressLabel")
 
         progress_row = QHBoxLayout()
         progress_row.setContentsMargins(8, 2, 8, 2)
@@ -113,11 +98,11 @@ class MainWindow(QMainWindow):
         self._progress_widget.setLayout(progress_row)
         self._progress_widget.setVisible(False)
 
-        # --- Module config area (stacked) ---
+        # ── Module config stack ──
         self._module_stack = QStackedWidget()
         self._module_stack.setObjectName("moduleStack")
 
-        # --- Results & Log ---
+        # ── Results & Log ──
         self._results_table = ResultsTable()
         self._log_widget = LogWidget()
         self._log_widget.setObjectName("logPane")
@@ -136,39 +121,57 @@ class MainWindow(QMainWindow):
         inspector_layout.addWidget(self._module_stack)
 
         main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setObjectName("mainSplitter")
         main_splitter.addWidget(results_pane)
         main_splitter.addWidget(inspector_pane)
         main_splitter.setSizes([720, 380])
 
-        self._log_widget.setMinimumHeight(140)
+        self._log_widget.setMinimumHeight(120)
         vertical_splitter = QSplitter(Qt.Vertical)
         vertical_splitter.addWidget(main_splitter)
         vertical_splitter.addWidget(self._log_widget)
         vertical_splitter.setSizes([520, 180])
 
+        # ── Right content area ──
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        content_layout.addWidget(top_bar)
+        content_layout.addWidget(self._progress_widget)
+        content_layout.addWidget(vertical_splitter)
+
+        # ── Root: Sidebar + Content ──
         root = QWidget()
-        root_layout = QVBoxLayout(root)
+        root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.addWidget(top_bar)
-        root_layout.addWidget(self._progress_widget)
-        root_layout.addWidget(vertical_splitter)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._sidebar)
+        root_layout.addWidget(content, 1)
         self.setCentralWidget(root)
 
-        # Signals
+        # ── Signals ──
         self._start_btn.clicked.connect(self._on_start)
         self._stop_btn.clicked.connect(self._on_stop)
         i18n.language_changed.connect(self.retranslate_ui)
 
+        # ── Keyboard shortcuts ──
+        for i in range(min(9, len(registry.get_modules()))):
+            QShortcut(QKeySequence(f"Ctrl+{i+1}"), self).activated.connect(
+                lambda idx=i: self._sidebar.select_module(idx)
+            )
+        QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self._on_start)
+        QShortcut(QKeySequence("Escape"), self).activated.connect(self._on_stop)
+        QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self._quick_export)
+
         # Initial translation
         self.retranslate_ui()
 
-        # Показываем первый модуль
+        # Show first module
         if registry.get_modules():
             self._on_module_selected(registry.get_modules()[0])
 
-    # ------------------------------------------------------------------
-    # Language switching
-    # ------------------------------------------------------------------
+    # ── Language ──
 
     def _set_lang(self, lang: str) -> None:
         from app.core.config import Config
@@ -197,9 +200,7 @@ class MainWindow(QMainWindow):
         }
         QDesktopServices.openUrl(QUrl(urls.get(i18n.language, urls["en"])))
 
-    # ------------------------------------------------------------------
-    # Module selection
-    # ------------------------------------------------------------------
+    # ── Module selection ──
 
     def _on_module_selected(self, module: BaseModule) -> None:
         if module is self._current_module:
@@ -218,20 +219,25 @@ class MainWindow(QMainWindow):
             widget = module.get_config_widget()
             if widget is None:
                 from app.ui.module_views.placeholder_view import PlaceholderView
-
                 widget = PlaceholderView(module.name)
             self._config_widgets[key] = widget
             self._module_stack.addWidget(widget)
         self._module_stack.setCurrentWidget(widget)
 
+    # ── Start / Stop ──
+
     def _on_start(self) -> None:
         if self._current_module is None:
+            return
+        if not self._start_btn.isEnabled():
             return
         from app.integrations.analytics import track
         track("module_started", {"module": self._current_module.name})
         self._results_table.clear_results()
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
+
+        self._sidebar.set_module_status(self._current_module, "running")
 
         self._done_count = 0
         self._total_count = self._current_module.get_item_count()
@@ -240,7 +246,7 @@ class MainWindow(QMainWindow):
             self._progress_bar.setValue(0)
             self._progress_label.setText(f"0 / {self._total_count}")
         else:
-            self._progress_bar.setRange(0, 0)  # indeterminate pulsing
+            self._progress_bar.setRange(0, 0)
             self._progress_label.setText("")
         self._progress_widget.setVisible(True)
 
@@ -258,11 +264,11 @@ class MainWindow(QMainWindow):
         )
         logger = Logger(on_log_signal=self._task_runner.on_log)
         ctx.extra["logger"] = logger
-
         self._task_runner.submit(self._current_module, ctx)
 
     def _on_stop(self) -> None:
-        self._task_runner.stop_module()
+        if self._stop_btn.isEnabled():
+            self._task_runner.stop_module()
 
     def _on_result(self, result: Result) -> None:
         self._results_table.add_row(result)
@@ -278,7 +284,26 @@ class MainWindow(QMainWindow):
     def _on_finished(self) -> None:
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+
+        cached = self._results_table.snapshot()
+        has_errors = any(r.status.value == "error" for r in cached)
+        status = "error" if has_errors else "done"
+
+        if self._current_module:
+            self._sidebar.set_module_status(self._current_module, status)
+
         if self._total_count > 0:
             self._progress_bar.setValue(self._total_count)
             self._progress_label.setText(f"{self._done_count} / {self._total_count}")
-        QTimer.singleShot(1000, lambda: self._progress_widget.setVisible(False))
+
+        # Toast notification
+        if has_errors:
+            show_toast(self, tr("toast_finished_errors"), level="warning")
+        else:
+            show_toast(self, tr("toast_finished_ok"), level="success")
+
+        QTimer.singleShot(2000, lambda: self._progress_widget.setVisible(False))
+
+    def _quick_export(self) -> None:
+        """Ctrl+E — trigger XLSX export if there are results."""
+        self._results_table._on_export_xlsx()

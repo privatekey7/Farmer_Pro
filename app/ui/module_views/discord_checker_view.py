@@ -1,9 +1,9 @@
 from __future__ import annotations
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QLabel, QLineEdit, QPushButton, QFileDialog,
-    QComboBox,
+    QLabel, QFileDialog, QComboBox, QPushButton,
 )
+from app.ui.widgets.drop_zone import DropZone
 from app.core.models import ProxyConfig
 from app.storage.parsers import parse_proxies, parse_lines
 from app.i18n import tr, i18n
@@ -23,36 +23,20 @@ class DiscordCheckerConfigWidget(QWidget):
         layout.setSpacing(8)
 
         # --- Tokens ---
-        token_row = QHBoxLayout()
-        self._lbl_tokens = QLabel()
-        token_row.addWidget(self._lbl_tokens)
-        self._token_path = QLineEdit()
-        self._token_path.setPlaceholderText("tokens.txt")
-        self._token_path.setReadOnly(True)
-        token_row.addWidget(self._token_path)
-        self._browse_tokens_btn = QPushButton()
-        self._browse_tokens_btn.clicked.connect(self._browse_tokens)
-        token_row.addWidget(self._browse_tokens_btn)
-        layout.addLayout(token_row)
-
-        self._token_status = QLabel(tr("file_not_loaded"))
-        layout.addWidget(self._token_status)
+        self._token_drop = DropZone(
+            label=tr("tokens_label_checker"),
+            placeholder="tokens.txt",
+        )
+        self._token_drop.file_dropped.connect(self._on_token_file)
+        layout.addWidget(self._token_drop)
 
         # --- Proxies ---
-        proxy_row = QHBoxLayout()
-        self._lbl_proxy = QLabel()
-        proxy_row.addWidget(self._lbl_proxy)
-        self._proxy_path = QLineEdit()
-        self._proxy_path.setPlaceholderText("proxy.txt")
-        self._proxy_path.setReadOnly(True)
-        proxy_row.addWidget(self._proxy_path)
-        self._browse_proxies_btn = QPushButton()
-        self._browse_proxies_btn.clicked.connect(self._browse_proxies)
-        proxy_row.addWidget(self._browse_proxies_btn)
-        layout.addLayout(proxy_row)
-
-        self._proxy_status = QLabel(tr("file_not_loaded"))
-        layout.addWidget(self._proxy_status)
+        self._proxy_drop = DropZone(
+            label=tr("proxy_label_checker"),
+            placeholder="proxy.txt",
+        )
+        self._proxy_drop.file_dropped.connect(self._on_proxy_file)
+        layout.addWidget(self._proxy_drop)
 
         # --- Export (disabled until run completes) ---
         self._export_group = QGroupBox()
@@ -88,49 +72,31 @@ class DiscordCheckerConfigWidget(QWidget):
         i18n.language_changed.connect(self.retranslate_ui)
 
     def retranslate_ui(self) -> None:
-        self._lbl_tokens.setText(tr("tokens_label_checker"))
-        self._lbl_proxy.setText(tr("proxy_label_checker"))
-        self._browse_tokens_btn.setText(tr("browse_btn"))
-        self._browse_proxies_btn.setText(tr("browse_btn"))
+        self._token_drop.set_label(tr("tokens_label_checker"))
+        self._proxy_drop.set_label(tr("proxy_label_checker"))
         self._export_group.setTitle(tr("export_group"))
         self._lbl_status.setText(tr("status_label"))
         self._lbl_format.setText(tr("format_label"))
         self._export_btn.setText(tr("export_btn"))
         self._status_combo.setItemText(0, tr("filter_all"))
-        if not self._tokens:
-            self._token_status.setText(tr("file_not_loaded"))
-        if not self._proxies:
-            self._proxy_status.setText(tr("file_not_loaded"))
 
     # --- File loading ---
 
-    def _browse_tokens(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("select_tokens_file"), "", "Text files (*.txt);;All files (*)"
-        )
-        if not path:
-            return
+    def _on_token_file(self, path: str) -> None:
         try:
             self._tokens = parse_lines(path)
-            self._token_path.setText(path)
-            self._token_status.setText(tr("n_tokens_loaded").format(n=len(self._tokens)))
+            self._token_drop.set_status(tr("n_tokens_loaded").format(n=len(self._tokens)))
         except Exception as e:
             self._tokens = []
-            self._token_status.setText(tr("error_fmt").format(e=e))
+            self._token_drop.set_status(tr("error_fmt").format(e=e))
 
-    def _browse_proxies(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("select_proxy_file"), "", "Text files (*.txt);;All files (*)"
-        )
-        if not path:
-            return
+    def _on_proxy_file(self, path: str) -> None:
         try:
             self._proxies = parse_proxies(path)
-            self._proxy_path.setText(path)
-            self._proxy_status.setText(tr("n_proxies_loaded").format(n=len(self._proxies)))
+            self._proxy_drop.set_status(tr("n_proxies_loaded").format(n=len(self._proxies)))
         except Exception as e:
             self._proxies = []
-            self._proxy_status.setText(tr("error_fmt").format(e=e))
+            self._proxy_drop.set_status(tr("error_fmt").format(e=e))
 
     # --- Accessors (called by module) ---
 
