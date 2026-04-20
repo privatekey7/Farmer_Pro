@@ -1,4 +1,5 @@
 # FarmerPro
+<img width="1193" height="727" alt="Снимок экрана 2026-04-20 150801" src="https://github.com/user-attachments/assets/2bcfb31c-2c54-4203-9747-c21c440e6b54" />
 
 **[English](#english) | [Русский](#русский)**
 
