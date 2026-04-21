@@ -69,6 +69,85 @@ def _is_native_token(
     return False
 
 
+def _remember_gasless_chain(
+    gasless_map: dict[int, dict],
+    *,
+    chain_id: int,
+    debank_key: str,
+    eth_balance: int,
+    required_wei: int,
+    native_token_addr: str,
+    contract: str,
+    symbol: str,
+    value_usd: float,
+) -> None:
+    """Сохраняет цепь как кандидат на refuel и накапливает проблемные токены."""
+    if chain_id not in gasless_map:
+        gasless_map[chain_id] = {
+            "chain_id": chain_id,
+            "debank_key": debank_key,
+            "eth_balance": eth_balance,
+            "max_gas_needed_wei": 0,
+            "native_token_addr": native_token_addr,
+            "tokens": [],
+        }
+
+    gc = gasless_map[chain_id]
+    gc["eth_balance"] = min(gc.get("eth_balance", eth_balance), eth_balance)
+    gc["max_gas_needed_wei"] = max(gc["max_gas_needed_wei"], int(required_wei))
+
+    known_contracts = {token["contract"] for token in gc["tokens"]}
+    if contract not in known_contracts:
+        gc["tokens"].append({"contract": contract, "symbol": symbol, "value_usd": value_usd})
+
+
+def _hi(v) -> int:
+    """Парсит hex (0x-префикс) или decimal строку/int в int."""
+    if not v:
+        return 0
+    if isinstance(v, str):
+        return int(v, 16) if v.startswith("0x") else int(v)
+    return int(v)
+
+
+async def _estimate_swap_tx_cost(
+    loop: asyncio.AbstractEventLoop,
+    w3: Any,
+    tx_req: dict,
+) -> tuple[int, int, int, int]:
+    """
+    Возвращает (gas_limit, effective_gas_price, tx_value, l1_data_fee) для swap tx.
+    Логика зеркалирует sign_and_send и добавляет L1 data fee для OP-stack цепей.
+    """
+    from app.modules.token_collector._bridge_logic import _get_l1_fee_safe
+
+    gas_limit = _hi(tx_req.get("gasLimit") or tx_req.get("gas"))
+    tx_value = _hi(tx_req.get("value"))
+
+    if "maxFeePerGas" in tx_req:
+        priority = max(1, _hi(tx_req.get("maxPriorityFeePerGas")))
+        try:
+            base_fee = await loop.run_in_executor(
+                None, lambda: w3.eth.get_block("latest")["baseFeePerGas"]
+            )
+            effective_gas_price = base_fee * 11 // 10 + priority
+        except Exception:
+            quote_max_fee = _hi(tx_req.get("maxFeePerGas"))
+            effective_gas_price = max(quote_max_fee * 2, priority)
+    else:
+        quote_gas_price = _hi(tx_req.get("gasPrice"))
+        try:
+            base_fee = await loop.run_in_executor(
+                None, lambda: w3.eth.get_block("latest").get("baseFeePerGas") or 0
+            )
+            effective_gas_price = max(quote_gas_price, base_fee * 2) if base_fee else quote_gas_price * 2
+        except Exception:
+            effective_gas_price = quote_gas_price * 2 if quote_gas_price else 0
+
+    l1_data_fee = await loop.run_in_executor(None, _get_l1_fee_safe, w3, tx_req)
+    return gas_limit, effective_gas_price, tx_value, l1_data_fee
+
+
 async def fetch_and_swap(
     wallet: dict,                               # {"raw": "0x...", "type": "private_key"}
     lifi_client: Any,                           # LiFiClient
@@ -228,6 +307,17 @@ async def fetch_and_swap(
 
             logger.info("[Wallet %s] [%s] Swapping %s ($%.2f) → native", address[:10], debank_key, symbol, value_usd)
 
+            gas_limit = 0
+            effective_gas_price = 0
+            tx_value = 0
+            eth_needed = 0
+            eth_balance = 0
+            l1_data_fee = 0
+            spender = ""
+            approval_done = False
+            tx_req: dict[str, Any] = {}
+            APPROVE_GAS_BUFFER = 100_000
+
             try:
                 # Проверяем маршрут
                 connections = await loop.run_in_executor(
@@ -249,73 +339,44 @@ async def fetch_and_swap(
 
                 tx_req = quote["transactionRequest"]
 
-                # Проверяем что ETH хватит на газ свапа (sign_and_send удваивает gasPrice)
-                def _hi(v) -> int:
-                    if not v:
-                        return 0
-                    if isinstance(v, str):
-                        return int(v, 16) if v.startswith("0x") else int(v)
-                    return int(v)
-
-                gas_limit = _hi(tx_req.get("gasLimit") or tx_req.get("gas"))
-                # Зеркалируем логику sign_and_send: для EIP-1559 используем priority из котировки.
-                # На L2 (OP, ARB, Base) LI.FI выставляет priority=0 — это нормально.
-                # НЕ форсируем 1 gwei: это завышает оценку газа в 100–1000x на L2.
-                if "maxFeePerGas" in tx_req:
-                    quote_priority = _hi(tx_req.get("maxPriorityFeePerGas"))
-                    try:
-                        base_fee = await loop.run_in_executor(
-                            None, lambda: w3.eth.get_block("latest")["baseFeePerGas"]
-                        )
-                        # Зеркалируем sign_and_send: maxFeePerGas = baseFee * 1.1 + priority
-                        effective_gas_price = base_fee * 11 // 10 + quote_priority
-                    except Exception:
-                        effective_gas_price = _hi(tx_req.get("maxFeePerGas"))
-                else:
-                    # Legacy tx (BSC и другие non-EIP-1559 сети)
-                    quote_gas_price = _hi(tx_req.get("gasPrice"))
-                    try:
-                        base_fee = await loop.run_in_executor(
-                            None, lambda: w3.eth.get_block("latest").get("baseFeePerGas") or 0
-                        )
-                        effective_gas_price = max(quote_gas_price, base_fee) if base_fee else quote_gas_price
-                    except Exception:
-                        effective_gas_price = quote_gas_price
-
-                tx_value = _hi(tx_req.get("value"))
-                # +100_000 gas — резерв на ERC-20 approve (выполняется перед swap)
-                APPROVE_GAS_BUFFER = 100_000
-                eth_needed = tx_value + (gas_limit + APPROVE_GAS_BUFFER) * effective_gas_price
+                gas_limit, effective_gas_price, tx_value, l1_data_fee = await _estimate_swap_tx_cost(
+                    loop, w3, tx_req
+                )
+                # Резерв на отдельный approve tx. На OP-stack учитываем и его L1 data fee.
+                approve_reserve = APPROVE_GAS_BUFFER * effective_gas_price
+                if tx_req.get("to"):
+                    approve_reserve += l1_data_fee
+                eth_needed = tx_value + gas_limit * effective_gas_price + l1_data_fee + approve_reserve
                 eth_balance = await loop.run_in_executor(None, w3.eth.get_balance, address)
 
                 # +10% запас на флуктуацию baseFee между предпроверкой и отправкой
                 if eth_balance < int(eth_needed * 1.1):
                     logger.warning(
                         "[Wallet %s] [%s] Skip %s swap: ETH balance %d < needed %d "
-                        "(gas_limit=%d gas_price=%d approve_buf=%d value=%d)",
+                        "(gas_limit=%d gas_price=%d l1_fee=%d approve_buf=%d value=%d)",
                         address[:10], debank_key, symbol,
                         eth_balance, eth_needed,
                         gas_limit, effective_gas_price,
+                        l1_data_fee,
                         APPROVE_GAS_BUFFER * effective_gas_price,
                         tx_value,
                     )
-                    # Запоминаем для возможного рефьюела
-                    if chain_id not in gasless_map:
-                        gasless_map[chain_id] = {
-                            "chain_id": chain_id,
-                            "debank_key": debank_key,
-                            "eth_balance": eth_balance,
-                            "max_gas_needed_wei": 0,
-                            "native_token_addr": native_token_addr,
-                            "tokens": [],
-                        }
-                    gc = gasless_map[chain_id]
-                    gc["max_gas_needed_wei"] = max(gc["max_gas_needed_wei"], int(eth_needed * 1.1))
-                    gc["tokens"].append({"contract": contract, "symbol": symbol, "value_usd": value_usd})
+                    _remember_gasless_chain(
+                        gasless_map,
+                        chain_id=chain_id,
+                        debank_key=debank_key,
+                        eth_balance=eth_balance,
+                        required_wei=int(eth_needed * 1.1),
+                        native_token_addr=native_token_addr,
+                        contract=contract,
+                        symbol=symbol,
+                        value_usd=value_usd,
+                    )
                     continue
 
                 # ERC-20 approve: даём разрешение LI.FI diamond тратить токен
                 spender = tx_req.get("to", "")
+                approval_done = not bool(spender)
                 if spender:
                     approved = await loop.run_in_executor(
                         None, ensure_erc20_approval,
@@ -327,6 +388,7 @@ async def fetch_and_swap(
                             address[:10], debank_key, symbol,
                         )
                         continue
+                    approval_done = True
 
                 tx_hash, receipt = await loop.run_in_executor(
                     None, sign_and_send, w3, tx_req, private_key, address
@@ -357,6 +419,52 @@ async def fetch_and_swap(
                     await asyncio.sleep(1)
 
             except InsufficientFundsError:
+                current_balance = eth_balance
+                try:
+                    current_balance = await loop.run_in_executor(None, w3.eth.get_balance, address)
+                except Exception as balance_error:
+                    logger.debug(
+                        "[Wallet %s] [%s] Could not refresh ETH balance after insufficient funds: %s",
+                        address[:10], debank_key, balance_error,
+                    )
+
+                if tx_req:
+                    gas_limit, effective_gas_price, tx_value, l1_data_fee = await _estimate_swap_tx_cost(
+                        loop, w3, tx_req
+                    )
+
+                remaining_needed = tx_value + gas_limit * effective_gas_price + l1_data_fee
+                if approval_done:
+                    required_wei = remaining_needed
+                else:
+                    approve_reserve = APPROVE_GAS_BUFFER * effective_gas_price
+                    if spender:
+                        approve_reserve += l1_data_fee
+                    required_wei = remaining_needed + approve_reserve
+
+                # Нода уже отвергла tx, значит наша локальная оценка всё ещё занижена
+                # (например из-за L1 fee или роста baseFee). Делаем гарантированно
+                # положительный дефицит, чтобы refuel не ушёл в отрицательное значение.
+                if required_wei <= current_balance:
+                    shortfall_floor = max(
+                        l1_data_fee,
+                        gas_limit * max(effective_gas_price, 1) // 10,
+                        1,
+                    )
+                    required_wei = current_balance + shortfall_floor
+
+                if required_wei > 0:
+                    _remember_gasless_chain(
+                        gasless_map,
+                        chain_id=chain_id,
+                        debank_key=debank_key,
+                        eth_balance=current_balance,
+                        required_wei=int(required_wei * 1.1),
+                        native_token_addr=native_token_addr,
+                        contract=contract,
+                        symbol=symbol,
+                        value_usd=value_usd,
+                    )
                 logger.warning(
                     "[Wallet %s] [%s] Skip %s swap: insufficient ETH for gas (node rejected)",
                     address[:10], debank_key, symbol,

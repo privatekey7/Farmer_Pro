@@ -69,6 +69,99 @@ def _get_l1_fee_safe(w3: Any, tx_req: dict) -> int:
         return 0  # Non-OP-stack цепь или оракул недоступен
 
 
+def _relay_quote_is_too_small_error(exc: Exception) -> bool:
+    """Определяет ошибки Relay, где нужно просто увеличить input-amount."""
+    msg = str(exc).lower()
+    needles = (
+        "too small",
+        "cover fees",
+        "minimum amount",
+        "minimum input",
+        "insufficient output amount",
+    )
+    return any(needle in msg for needle in needles)
+
+
+def _relay_quote_out_amount(relay_quote: dict) -> int:
+    """Возвращает ожидаемый amount на destination chain из Relay quote."""
+    try:
+        return int(relay_quote.get("details", {}).get("currencyOut", {}).get("amount") or 0)
+    except Exception:
+        return 0
+
+
+async def _find_refuel_quote(
+    *,
+    loop: asyncio.AbstractEventLoop,
+    relay_client: Any,
+    donor_chain_id: int,
+    tgt_chain_id: int,
+    donor_native: str,
+    tgt_native: str,
+    address: str,
+    requested_amount_wei: int,
+    min_required_out_wei: int,
+    max_refuel_amount_wei: int | None,
+) -> tuple[int, int, dict] | tuple[None, None, None]:
+    """
+    Подбирает минимальный input для Relay refuel.
+    Увеличивает сумму, если route слишком маленький или ожидаемый output меньше требуемого.
+    """
+    candidate_amount = max(1, int(requested_amount_wei))
+    max_amount = max(candidate_amount, int(max_refuel_amount_wei or candidate_amount))
+    last_error: Exception | None = None
+
+    for _ in range(8):
+        try:
+            relay_q = await loop.run_in_executor(
+                None,
+                relay_client.get_quote,
+                donor_chain_id, tgt_chain_id,
+                donor_native, tgt_native,
+                str(candidate_amount), address,
+            )
+            out_amount = _relay_quote_out_amount(relay_q)
+            if min_required_out_wei and out_amount < min_required_out_wei:
+                last_error = RuntimeError(
+                    f"quoted output {out_amount} < required {min_required_out_wei}"
+                )
+            else:
+                return candidate_amount, out_amount, relay_q
+        except Exception as e:
+            last_error = e
+            if not _relay_quote_is_too_small_error(e):
+                break
+            out_amount = 0
+
+        if candidate_amount >= max_amount:
+            break
+
+        if min_required_out_wei and out_amount > 0:
+            scaled_amount = (
+                candidate_amount * min_required_out_wei * 11 + (out_amount * 10) - 1
+            ) // (out_amount * 10)
+            next_amount = max(candidate_amount * 2, scaled_amount)
+        else:
+            next_amount = candidate_amount * 2
+
+        next_amount = min(max_amount, next_amount)
+        if next_amount <= candidate_amount:
+            break
+
+        logger.info(
+            "[Refuel] Bumping input for %s → %s from %d to %d wei",
+            donor_chain_id, tgt_chain_id, candidate_amount, next_amount,
+        )
+        candidate_amount = next_amount
+
+    if last_error:
+        logger.warning(
+            "[Refuel] Could not find viable quote %s → %s up to %d wei: %s",
+            donor_chain_id, tgt_chain_id, max_amount, last_error,
+        )
+    return None, None, None
+
+
 async def bridge_native(
     address: str,
     private_key: str,
@@ -476,6 +569,8 @@ async def refuel_chain(
     donor_chain_id: int,
     tgt_chain_id: int,
     refuel_amount_wei: int,
+    min_required_out_wei: int,
+    max_refuel_amount_wei: int | None,
     relay_client: Any,
     relay_native_by_id: dict[int, dict],
     rpc_resolver: Any,
@@ -503,22 +598,36 @@ async def refuel_chain(
     )
 
     logger.info(
-        "[Refuel] %s → chain %s: sending %d wei (%s ETH) for gas",
+        "[Refuel] %s → chain %s: requesting %d wei (%s ETH) for gas",
         donor_chain_id, tgt_chain_id, refuel_amount_wei, refuel_amount_wei / 1e18,
     )
 
-    try:
-        relay_q = await loop.run_in_executor(
-            None,
-            relay_client.get_quote,
-            donor_chain_id, tgt_chain_id,
-            donor_native, tgt_native,
-            str(refuel_amount_wei), address,
-        )
-        tx_req = relay_q["steps"][0]["items"][0]["data"]
-    except Exception as e:
-        logger.warning("[Refuel] Relay quote failed (%s → %s): %s", donor_chain_id, tgt_chain_id, e)
+    actual_refuel_amount, quoted_out_amount, relay_q = await _find_refuel_quote(
+        loop=loop,
+        relay_client=relay_client,
+        donor_chain_id=donor_chain_id,
+        tgt_chain_id=tgt_chain_id,
+        donor_native=donor_native,
+        tgt_native=tgt_native,
+        address=address,
+        requested_amount_wei=refuel_amount_wei,
+        min_required_out_wei=min_required_out_wei,
+        max_refuel_amount_wei=max_refuel_amount_wei,
+    )
+    if not relay_q or actual_refuel_amount is None:
         return False
+
+    tx_req = relay_q["steps"][0]["items"][0]["data"]
+    if actual_refuel_amount != refuel_amount_wei:
+        logger.info(
+            "[Refuel] Adjusted input %s → %s: %d -> %d wei (quoted out %d wei)",
+            donor_chain_id, tgt_chain_id, refuel_amount_wei, actual_refuel_amount, quoted_out_amount or 0,
+        )
+    else:
+        logger.info(
+            "[Refuel] %s → chain %s: sending %d wei (%s ETH) for gas",
+            donor_chain_id, tgt_chain_id, actual_refuel_amount, actual_refuel_amount / 1e18,
+        )
 
     try:
         w3_donor = rpc_resolver.get_web3(donor_chain_id)
@@ -545,7 +654,8 @@ async def refuel_chain(
     logger.info("[Refuel] Tx sent: %s — waiting for arrival on chain %s...", tx_hash, tgt_chain_id)
 
     # Ожидаем поступления
-    expected_min = max(1, int(refuel_amount_wei * 0.3))  # 30% от отправленного
+    expected_base = quoted_out_amount or actual_refuel_amount
+    expected_min = max(1, int(expected_base * 0.3))  # 30% от ожидаемого output
     elapsed = 0
     while elapsed < REFUEL_TIMEOUT_SEC:
         if stop_event.is_set():

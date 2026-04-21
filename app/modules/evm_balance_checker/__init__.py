@@ -12,6 +12,20 @@ from app.integrations.proxy_utils import ProxyRotator
 
 RETRY_ATTEMPTS = 10
 MIN_VALUE_DISPLAY = 0.01
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
+
+def _asset_value_usd(token: dict) -> float:
+    return (token.get("price", 0) or 0) * (token.get("amount", 0) or 0)
+
+
+def _is_native_asset(token: dict) -> bool:
+    """DeBank marks ERC-20 balances with a hex token id; native assets use the chain key."""
+    token_id = str(token.get("id", "") or "").lower()
+    contract = str(token.get("contract_address", "") or "").lower()
+    if contract and contract != ZERO_ADDR:
+        return False
+    return not token_id.startswith("0x")
 
 
 def _check_wallet_sync(
@@ -34,22 +48,25 @@ def _check_wallet_sync(
             client = DeBankClient(proxy=proxy.to_url())
             tokens = client.get_tokens(address)
 
-            # --- Токены (только они — максимально быстрая проверка) ---
-            tokens_usd = sum(t.get("price", 0) * t.get("amount", 0) for t in tokens)
+            total_usd = sum(_asset_value_usd(t) for t in tokens)
+            tokens_usd = sum(
+                _asset_value_usd(t)
+                for t in tokens
+                if not _is_native_asset(t)
+            )
             tokens_data = [
                 {
                     "symbol": t.get("symbol", "?"),
                     "chain":  t.get("chain", "?"),
                     "amount": t.get("amount", 0),
                     "price":  t.get("price", 0),
-                    "value":  round(t.get("price", 0) * t.get("amount", 0), 2),
+                    "value":  round(_asset_value_usd(t), 2),
                 }
                 for t in tokens
-                if round(t.get("price", 0) * t.get("amount", 0), 2) >= MIN_VALUE_DISPLAY
+                if round(_asset_value_usd(t), 2) >= MIN_VALUE_DISPLAY
             ]
             tokens_data.sort(key=lambda x: x["value"], reverse=True)
 
-            total_usd = tokens_usd
             chains = sorted({t["chain"] for t in tokens_data})
             top_tokens = ", ".join(
                 f"{t['symbol']}(${t['value']:.2f})" for t in tokens_data[:3]

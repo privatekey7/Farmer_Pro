@@ -24,6 +24,23 @@ from app.modules.token_collector._bridge_logic import bridge_native, send_to_exc
 logger = logging.getLogger(__name__)
 
 
+def _build_processed_bridge_keys(chains_processed: str, target_chains: list[str]) -> list[str]:
+    """Готовит список source chains для bridge loop без дублей и target chains."""
+    target_key_set = {chain.lower() for chain in target_chains}
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for raw_key in chains_processed.split(", "):
+        key = raw_key.strip()
+        key_lower = key.lower()
+        if not key or key_lower in target_key_set or key_lower in seen:
+            continue
+        seen.add(key_lower)
+        result.append(key)
+
+    return result
+
+
 class _CollectorSignals(QObject):
     # Создаётся в __init__ (main thread) — обеспечивает Qt thread affinity
     run_complete = Signal(list, dict)
@@ -261,8 +278,15 @@ class CollectorModule(BaseModule):
                                 or relay_native_by_id.get(tgt_cid, {}).get("priceUSD")
                                 or 2000
                             )
-                            gas_deficit = gc["max_gas_needed_wei"] - gc.get("eth_balance", 0)
-                            refuel_usd = gas_deficit / 1e18 * gasless_price_usd * 2  # 2× запас
+                            gas_deficit = max(0, gc["max_gas_needed_wei"] - gc.get("eth_balance", 0))
+                            if gas_deficit <= 0:
+                                logger.info(
+                                    "[Wallet %s] Chain %s no longer needs refuel",
+                                    address[:10], tgt_cid,
+                                )
+                                continue
+                            desired_out_wei = gas_deficit * 2  # 2× запас на целевой сети
+                            refuel_usd = desired_out_wei / 1e18 * gasless_price_usd
 
                             donor_found = False
                             for donor_cid in donor_candidates:
@@ -285,12 +309,17 @@ class CollectorModule(BaseModule):
                                     continue
                                 # Конвертируем нужную сумму в нативные единицы донора
                                 refuel_amount = int(refuel_usd / donor_price_usd * 1e18)
+                                max_refuel_amount = int(max(0.0, donor_bal_usd - 0.01) / donor_price_usd * 1e18)
+                                if max_refuel_amount <= 0:
+                                    continue
                                 ok = await refuel_chain(
                                     address=address,
                                     private_key=private_key,
                                     donor_chain_id=donor_cid,
                                     tgt_chain_id=tgt_cid,
                                     refuel_amount_wei=refuel_amount,
+                                    min_required_out_wei=desired_out_wei,
+                                    max_refuel_amount_wei=max_refuel_amount,
                                     relay_client=relay_client,
                                     relay_native_by_id=relay_native_by_id,
                                     rpc_resolver=rpc_resolver,
@@ -337,14 +366,10 @@ class CollectorModule(BaseModule):
                     for _k in ("private_key", "address", "chains_processed", "chains_skipped"):
                         result_data.pop(_k, None)
 
-                    # Выбираем src_chain — сеть с наибольшим балансом
-                    # Простая эвристика: первая из processed
-                    # Target chains участвуют только в свапе, но не в бридже FROM
-                    target_key_set = set(settings.target_chains)
-                    processed_keys = [
-                        k for k in swap_result.get("chains_processed", "").split(", ")
-                        if k and k not in target_key_set
-                    ]
+                    processed_keys = _build_processed_bridge_keys(
+                        chains_processed=swap_result.get("chains_processed", ""),
+                        target_chains=settings.target_chains,
+                    )
                     if not processed_keys:
                         result = Result(
                             item=address,
