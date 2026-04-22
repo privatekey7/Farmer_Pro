@@ -47,8 +47,7 @@ def _check_wallet_sync(
         try:
             client = DeBankClient(proxy=proxy.to_url())
             tokens = client.get_tokens(address)
-
-            total_usd = sum(_asset_value_usd(t) for t in tokens)
+            total_usd = client.get_total_usd(address)
             tokens_usd = sum(
                 _asset_value_usd(t)
                 for t in tokens

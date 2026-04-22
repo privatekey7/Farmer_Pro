@@ -116,3 +116,18 @@ class DeBankClient:
     def get_tokens(self, address: str) -> list:
         result = self._get("/token/cache_balance_list", {"user_addr": address})
         return result if isinstance(result, list) else []
+
+    def get_total_usd(self, address: str) -> float:
+        result = self._get("/asset/total_net_curve", {"user_addr": address, "days": 1})
+        points = result.get("usd_value_list", []) if isinstance(result, dict) else []
+        if not points:
+            return 0.0
+
+        last_point = points[-1]
+        if not isinstance(last_point, (list, tuple)) or len(last_point) < 2:
+            return 0.0
+
+        try:
+            return float(last_point[1] or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
