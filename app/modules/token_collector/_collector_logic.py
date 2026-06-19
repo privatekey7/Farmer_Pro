@@ -11,6 +11,64 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# ── Anti-phantom corroboration (см. evm_balance_checker) ───────────────────
+# Под высокой параллельной нагрузкой DeBank ~1/30 отдаёт портфель ЧУЖОГО адреса.
+# Ответ внутренне согласован (реальные токены), поэтому одиночная выборка фантом
+# не ловит. Особенность: истинный набор токенов СТАБИЛЕН между запросами,
+# фантом — СЛУЧАЕН и не повторяется. Принимаем список только когда >=2
+# независимые выборки сходятся по суммарному total_usd; иначе — консервативно
+# (наименьший total_usd), чтобы не раздувать своп фантомными токенами. ~2 запр./кошелёк.
+COLLECTOR_CORROBORATION_MIN_AGREE = 2     # сколько согласных выборок нужно
+COLLECTOR_CORROBORATION_TOL_PCT = 0.02    # относительный допуск (2%)
+COLLECTOR_CORROBORATION_TOL_ABS = 1.0     # абсолютный допуск ($1) — для мелких балансов
+COLLECTOR_CORROBORATION_MAX_FETCHES = 5   # бюджет УСПЕШНЫХ выборок на кошелёк
+
+
+def _tokens_total_usd(tokens: Any) -> float:
+    """Суммарная USD-стоимость списка токенов DeBank (price * amount)."""
+    if not isinstance(tokens, list):
+        return 0.0
+    total = 0.0
+    for t in tokens:
+        try:
+            total += (t.get("price", 0) or 0) * (t.get("amount", 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return total
+
+
+def _values_agree(a: float, b: float) -> bool:
+    """Согласованы ли два total_usd в пределах абсолютного ИЛИ относительного допуска."""
+    diff = abs(a - b)
+    if diff <= COLLECTOR_CORROBORATION_TOL_ABS:
+        return True
+    return diff <= COLLECTOR_CORROBORATION_TOL_PCT * max(abs(a), abs(b), 1.0)
+
+
+def _agreeing_cluster(snapshots: list[dict]) -> list[dict] | None:
+    """Наибольший кластер согласных по total_usd выборок (размером >= MIN_AGREE).
+
+    Возвращает None, пока ни один кластер не набрал нужного числа подтверждений.
+    """
+    best: list[dict] | None = None
+    for anchor in snapshots:
+        cluster = [s for s in snapshots if _values_agree(s["total_usd"], anchor["total_usd"])]
+        if len(cluster) >= COLLECTOR_CORROBORATION_MIN_AGREE and (best is None or len(cluster) > len(best)):
+            best = cluster
+    return best
+
+
+def _representative(cluster: list[dict]) -> dict:
+    """Из согласного кластера берём выборку с медианным total_usd (стабильный выбор)."""
+    ordered = sorted(cluster, key=lambda s: s["total_usd"])
+    return ordered[len(ordered) // 2]
+
+
+def _conservative_pick(snapshots: list[dict]) -> dict:
+    """Бюджет исчерпан без согласия → наименьший total_usd (исключает раздувание фантомом)."""
+    return min(snapshots, key=lambda s: s["total_usd"])
+
+
 def _get_native_addr(
     chain_id: int,
     native_token_by_id: dict[int, dict],
@@ -172,22 +230,49 @@ async def fetch_and_swap(
     address, private_key = derive_address(wallet["raw"], wallet["type"])
     loop = asyncio.get_running_loop()
 
-    # ШАГ 1: Получить балансы
+    # ШАГ 1: Получить балансы с подтверждением против фантомов DeBank.
+    # Принимаем список токенов только когда >=2 независимые выборки сошлись по
+    # суммарному total_usd (случайный фантом почти никогда не повторяется).
     DEBANK_RETRY = 10
-    tokens: list[dict] = []
+    snapshots: list[dict] = []          # [{"total_usd": float, "tokens": list}]
     last_exc: Exception | None = None
-    for _ in range(DEBANK_RETRY):
+    attempts = 0
+    max_attempts = COLLECTOR_CORROBORATION_MAX_FETCHES + DEBANK_RETRY  # запас на сетевые сбои
+    corroborated = False
+    tokens: list[dict] = []
+
+    while attempts < max_attempts and len(snapshots) < COLLECTOR_CORROBORATION_MAX_FETCHES:
         if stop_event.is_set():
             return {}
+        attempts += 1
         try:
-            tokens = await loop.run_in_executor(None, debank_client.get_tokens, address)
-            break
+            snap_tokens = await loop.run_in_executor(None, debank_client.get_tokens, address)
         except Exception as e:
             last_exc = e
             await asyncio.sleep(3)
-    else:
-        logger.error("[%s] DeBank failed after %d retries: %s", address[:10], DEBANK_RETRY, last_exc)
-        return {}
+            continue
+        snapshots.append({
+            "total_usd": _tokens_total_usd(snap_tokens),
+            "tokens": snap_tokens if isinstance(snap_tokens, list) else [],
+        })
+        cluster = _agreeing_cluster(snapshots)
+        if cluster is not None:
+            tokens = _representative(cluster)["tokens"]
+            corroborated = True
+            break
+
+    if not corroborated:
+        if not snapshots:
+            logger.error("[%s] DeBank failed after %d attempts: %s", address[:10], attempts, last_exc)
+            return {}
+        tokens = _conservative_pick(snapshots)["tokens"]
+        logger.warning(
+            "[Wallet %s] DeBank balances NOT corroborated after %d fetches "
+            "(no >=%d agreement on total_usd) — берём консервативный снимок ($%.2f); "
+            "возможен фантом, своп идёт только по on-chain balanceOf",
+            address[:10], len(snapshots), COLLECTOR_CORROBORATION_MIN_AGREE,
+            _tokens_total_usd(tokens),
+        )
 
     # Группируем по chain
     chains: dict[str, list[dict]] = {}
