@@ -114,4 +114,14 @@ TRANSLATIONS: dict[str, str] = {
 
     "toast_finished_ok": "✓ Выполнено успешно",
     "toast_finished_errors": "⚠ Выполнено с ошибками",
+
+    # Validation
+    "validation_no_wallets": "Сначала загрузите файл кошельков",
+    "validation_no_proxies": "Сначала загрузите файл прокси",
+    "validation_no_tokens": "Сначала загрузите файл токенов",
+    "validation_no_items": "Сначала загрузите входной файл",
+
+    # Log collapse
+    "log_expand_btn": "▲ Лог",
+    "log_collapse_btn": "▼ Лог",
 }

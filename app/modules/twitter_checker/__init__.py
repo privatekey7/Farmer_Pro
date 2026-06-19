@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QWidget
 
 from app.core.base_module import BaseModule
-from app.core.models import RunContext, Result, ResultStatus
+from app.core.models import RunContext, Result, ResultStatus, ColumnDef
 from app.integrations.proxy_utils import ProxyRotator
 from app.integrations.twitter_client import (
     TwitterClient,
@@ -85,6 +85,13 @@ class _TwitterSignals(QObject):
 
 class TwitterCheckerModule(BaseModule):
     name = "Twitter Checker"
+
+    def column_schema(self) -> list[ColumnDef]:
+        return [
+            ColumnDef(key="item",            label="Token",    width=200),
+            ColumnDef(key="account_status",  label="Status"),
+            ColumnDef(key="username",        label="Username"),
+        ]
 
     def __init__(self) -> None:
         from app.ui.module_views.twitter_checker_view import TwitterCheckerConfigWidget

@@ -4,7 +4,7 @@ import threading
 from typing import AsyncIterator
 
 from app.core.base_module import BaseModule
-from app.core.models import RunContext, Result, ResultStatus, ProxyConfig
+from app.core.models import RunContext, Result, ResultStatus, ProxyConfig, ColumnDef
 from app.integrations.pixelscan_client import check_quality
 
 BATCH_SIZE = 50
@@ -15,6 +15,7 @@ async def _check_proxy_async(proxy: ProxyConfig, stop_event: threading.Event) ->
         return Result(item=proxy.to_url(), status=ResultStatus.ERROR, error="Stopped")
     try:
         data = await check_quality(proxy)
+        data["proxy_type"] = proxy.protocol.upper()
         return Result(item=proxy.to_url(), status=ResultStatus.OK, data=data)
     except Exception as e:
         return Result(item=proxy.to_url(), status=ResultStatus.ERROR, error=str(e))
@@ -22,6 +23,15 @@ async def _check_proxy_async(proxy: ProxyConfig, stop_event: threading.Event) ->
 
 class ProxyCheckerModule(BaseModule):
     name = "Proxy Check"
+
+    def column_schema(self) -> list[ColumnDef]:
+        return [
+            ColumnDef(key="item",        label="Proxy",       width=220),
+            ColumnDef(key="status",      label="Status"),
+            ColumnDef(key="proxy_type",  label="Type"),
+            ColumnDef(key="quality",     label="Quality"),
+            ColumnDef(key="latency_ms",  label="Latency",     fmt="{} ms", sort_type="numeric"),
+        ]
 
     def __init__(self) -> None:
         from app.ui.module_views.proxy_checker_view import ProxyCheckerConfigWidget

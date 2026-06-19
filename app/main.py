@@ -22,7 +22,6 @@ from app.modules.twitter_checker import TwitterCheckerModule
 from app.modules.discord_token_checker import DiscordTokenCheckerModule
 from app.ui.main_window import MainWindow
 from app.ui.theme import apply_apple_dark_theme
-from app.integrations.analytics import track
 from app.i18n import i18n
 from app.resources.translations.en import TRANSLATIONS as EN
 from app.resources.translations.ru import TRANSLATIONS as RU
@@ -34,7 +33,6 @@ def main() -> None:
     i18n.load("ru", RU)
     i18n._lang = config.get("language", "en")
 
-    track("app_open")
     app = QApplication(sys.argv)
     apply_apple_dark_theme(app)
     icon_path = Path(__file__).parent / "resources" / "icon.png"

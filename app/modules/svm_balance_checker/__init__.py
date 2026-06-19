@@ -6,7 +6,7 @@ from typing import AsyncIterator
 from PySide6.QtCore import QObject, Signal
 
 from app.core.base_module import BaseModule
-from app.core.models import RunContext, Result, ResultStatus
+from app.core.models import RunContext, Result, ResultStatus, ColumnDef
 from app.integrations.proxy_utils import ProxyRotator
 from app.integrations.solana_rpc import SolanaClient
 
@@ -45,9 +45,7 @@ def _check_wallet_sync(
                 status=ResultStatus.OK,
                 data={
                     "sol_balance": round(data.sol_balance, 6),
-                    "sol_usd":     round(data.sol_usd, 2),
                     "total_usd":   round(data.total_usd, 2),
-                    "tokens":      len(tokens_data),
                     "top_tokens":  top_tokens,
                     "_detail":     {"tokens_data": tokens_data},
                 },
@@ -70,6 +68,15 @@ class _SvmSignals(QObject):
 
 class SvmBalanceCheckerModule(BaseModule):
     name = "SVM Balance"
+
+    def column_schema(self) -> list[ColumnDef]:
+        return [
+            ColumnDef(key="item",         label="Address",     width=200),
+            ColumnDef(key="status",       label="Status"),
+            ColumnDef(key="sol_balance",  label="SOL",         fmt="{:.4f}", sort_type="numeric"),
+            ColumnDef(key="total_usd",    label="Total $",     fmt="${:.2f}", sort_type="numeric"),
+            ColumnDef(key="top_tokens",   label="Top Tokens"),
+        ]
 
     def __init__(self) -> None:
         from app.ui.module_views.svm_balance_view import SvmBalanceConfigWidget

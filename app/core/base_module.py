@@ -4,7 +4,7 @@ from typing import AsyncIterator, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from PySide6.QtWidgets import QWidget
-    from .models import RunContext, Result
+    from .models import RunContext, Result, ColumnDef
 
 
 class BaseModule(ABC):
@@ -35,3 +35,11 @@ class BaseModule(ABC):
     def get_item_count(self) -> int:
         """Возвращает общее количество элементов для обработки. 0 = неизвестно."""
         return 0
+
+    def column_schema(self) -> "list[ColumnDef]":
+        """
+        Defines which columns the ResultsTable should display, their order,
+        labels, formatting, and sort type.  Return an empty list to fall back
+        to the legacy auto-derive behaviour (all result.data keys).
+        """
+        return []

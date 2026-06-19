@@ -9,7 +9,7 @@ from typing import AsyncIterator
 from PySide6.QtCore import QObject, Signal
 
 from app.core.base_module import BaseModule
-from app.core.models import RunContext, Result, ResultStatus
+from app.core.models import RunContext, Result, ResultStatus, ColumnDef
 from app.integrations.debank_client import DeBankClient
 from app.integrations.lifi_client import (
     LiFiClient, DEBANK_TO_CHAIN_ID, LiFiChainRegistry,
@@ -48,6 +48,17 @@ class _CollectorSignals(QObject):
 
 class CollectorModule(BaseModule):
     name = "Collector"
+
+    def column_schema(self) -> list[ColumnDef]:
+        return [
+            ColumnDef(key="item",                label="Address",       width=200),
+            ColumnDef(key="status",              label="Status"),
+            ColumnDef(key="tokens_swapped",      label="Swaps",         sort_type="numeric"),
+            ColumnDef(key="total_collected_usd",  label="Collected $",  fmt="${:.2f}", sort_type="numeric"),
+            ColumnDef(key="bridge_summary",      label="Bridges"),
+            ColumnDef(key="bridge_chain",        label="Route"),
+            ColumnDef(key="bridge_status",       label="Bridge"),
+        ]
 
     def __init__(self) -> None:
         from app.ui.module_views.collector_view import CollectorConfigWidget
@@ -476,7 +487,13 @@ class CollectorModule(BaseModule):
                     else:
                         result_data["bridge_chain"] = ""
                     result_data["bridge_tx"] = bridge_tx or ""
-                    result_data["bridge_ops"] = bridge_ops
+                    # Compact bridge summary for the table column
+                    if isinstance(bridge_ops, list) and bridge_ops:
+                        ok_count = sum(1 for op in bridge_ops if op.get("status") == "ok")
+                        result_data["bridge_summary"] = f"{ok_count}/{len(bridge_ops)}"
+                    else:
+                        result_data["bridge_summary"] = ""
+                    result_data["_detail_bridge_ops"] = bridge_ops   # full data for export only
                     result_data["bridge_status"] = bridge_status
                     result_data["exchange_tx"] = exchange_tx or ""
                     _SKIP_STATUSES = ("NO_QUOTE", "NO_ROUTE", "BELOW_MIN", "STOPPED", "INSUFFICIENT", "NOT_INDEXED", "TX_REVERTED")
