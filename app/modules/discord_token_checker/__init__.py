@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QWidget
 
 from app.core.base_module import BaseModule
-from app.core.models import RunContext, Result, ResultStatus
+from app.core.models import RunContext, Result, ResultStatus, ColumnDef
 from app.integrations.proxy_utils import ProxyRotator
 from app.integrations.discord_client import (
     DiscordClient,
@@ -91,6 +91,15 @@ class _DiscordSignals(QObject):
 
 class DiscordTokenCheckerModule(BaseModule):
     name = "Discord Checker"
+
+    def column_schema(self) -> list[ColumnDef]:
+        return [
+            ColumnDef(key="item",            label="Token",    width=200),
+            ColumnDef(key="account_status",  label="Status"),
+            ColumnDef(key="username",        label="Username"),
+            ColumnDef(key="email",           label="Email"),
+            ColumnDef(key="has_phone",       label="Phone"),
+        ]
 
     def __init__(self) -> None:
         from app.ui.module_views.discord_checker_view import DiscordCheckerConfigWidget

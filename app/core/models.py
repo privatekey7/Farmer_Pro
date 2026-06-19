@@ -35,6 +35,21 @@ class RunContext:
 
 
 @dataclass
+class ColumnDef:
+    """Defines how a column is displayed in ResultsTable."""
+    key: str                          # key in result.data (or "item"/"status")
+    label: str = ""                   # human-readable header; falls back to key
+    fmt: str = ""                     # Python format string, e.g. "${:.2f}", "{:.0f} ms"
+    width: int = 0                    # hint width in px (0 = stretch)
+    sort_type: str = "text"           # "text" | "numeric"
+    visible: bool = True              # False = only in export, hidden from table
+
+    def __post_init__(self) -> None:
+        if not self.label:
+            self.label = self.key
+
+
+@dataclass
 class Result:
     item: str
     status: ResultStatus
