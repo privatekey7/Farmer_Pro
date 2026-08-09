@@ -1,57 +1,14 @@
 from __future__ import annotations
-import hashlib
-import hmac as hmac_lib
 import json
-import random
 import threading
 import time
 import uuid
 
 import curl_cffi.requests as cffi_requests
 
+from app.integrations.api_signer import sign_request
+
 API_BASE = "https://api.debank.com"
-NONCE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXTZabcdefghiklmnopqrstuvwxyz"
-NONCE_LENGTH = 40
-
-
-def sort_params(params: dict) -> str:
-    if not params:
-        return ""
-    return "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-
-
-def sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def hmac_sha256(key_str: str, msg_str: str) -> str:
-    return hmac_lib.new(
-        key_str.encode("utf-8"),
-        msg_str.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def generate_nonce() -> str:
-    return "n_" + "".join(random.choices(NONCE_ALPHABET, k=NONCE_LENGTH))
-
-
-def sign_request(
-    params: dict,
-    method: str,
-    path: str,
-    nonce: str | None = None,
-    ts: int | None = None,
-    version: str = "v2",
-) -> dict:
-    ts = ts or int(time.time())
-    nonce = nonce or generate_nonce()
-    prefix = "debank-web\n" if version == "v2.1" else "debank-api\n"
-    sorted_p = sort_params(params)
-    K = sha256_hex(f"{prefix}{nonce}\n{ts}")
-    M = sha256_hex(f"{method.upper()}\n{path}\n{sorted_p}")
-    signature = hmac_sha256(K, M)
-    return {"signature": signature, "nonce": nonce, "ts": ts, "version": version}
 
 
 class DeBankClient:

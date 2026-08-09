@@ -1,3 +1,4 @@
+balance_source: rabby
 concurrency: 10
 language: ru
 log_level: INFO

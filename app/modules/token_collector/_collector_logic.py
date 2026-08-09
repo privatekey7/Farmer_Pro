@@ -209,7 +209,7 @@ async def _estimate_swap_tx_cost(
 async def fetch_and_swap(
     wallet: dict,                               # {"raw": "0x...", "type": "private_key"}
     lifi_client: Any,                           # LiFiClient
-    debank_client: Any,                         # DeBankClient
+    balance_client: Any,                        # BalanceClient (Rabby/DeBank)
     rpc_resolver: Any,                          # RpcResolver
     settings: Any,                              # CollectorSettings
     native_token_by_id: dict[int, dict],
@@ -220,7 +220,7 @@ async def fetch_and_swap(
     target_chain_ids: set[int] | None = None,   # исключаем таргет-цепи из total_usd
 ) -> dict:
     """
-    ШАГ 1-2: получить балансы DeBank, отфильтровать,
+    ШАГ 1-2: получить балансы (Rabby/DeBank по BALANCE_SOURCE), отфильтровать,
     своп не-нативных токенов в нативный через LI.FI.
     Возвращает статистику: chains_processed, chains_skipped, tokens_swapped, total_usd.
     """
@@ -246,7 +246,7 @@ async def fetch_and_swap(
             return {}
         attempts += 1
         try:
-            snap_tokens = await loop.run_in_executor(None, debank_client.get_tokens, address)
+            snap_tokens = await loop.run_in_executor(None, balance_client.get_tokens, address)
         except Exception as e:
             last_exc = e
             await asyncio.sleep(3)

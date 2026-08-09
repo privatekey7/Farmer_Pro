@@ -1,34 +1,41 @@
 from __future__ import annotations
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator
 
 from PySide6.QtCore import QObject, Signal
 
 from app.core.base_module import BaseModule
 from app.core.models import RunContext, Result, ResultStatus, ColumnDef
-from app.integrations.debank_client import DeBankClient
+from app.integrations.balance_client import get_balance_client
 from app.integrations.proxy_utils import ProxyRotator
 
-RETRY_ATTEMPTS = 10
+RETRY_ATTEMPTS = 6
 MIN_VALUE_DISPLAY = 0.01
 ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 
 # ── Anti-phantom corroboration ──────────────────────────────────────────────
-# Под высокой параллельной нагрузкой DeBank API ~1 раз из 30 возвращает портфель
-# ЧУЖОГО адреса. Ответ внутренне согласован (реальные токены/пулы), поэтому
-# одиночная выборка или пересчёт по одному снимку фантом не ловит — кошелёк на
-# ~$15 показывает тысячи/миллионы $. Особенность: истинный баланс СТАБИЛЕН между
-# запросами, фантом — СЛУЧАЙНЫЙ и не повторяется.
+# Под высокой параллельной нагрузкой API ~1 раз из 30 возвращает портфель
+# ЧУЖОГО адреса. Ответ внутренне согласован, поэтому одиночная выборка фантом
+# не ловит. Особенность: истинный баланс СТАБИЛЕН между запросами, фантом —
+# СЛУЧАЙНЫЙ. Решение: принимаем баланс, когда >=2 независимые выборки (разные
+# прокси) сходятся по total_usd.
 #
-# Решение — подтверждение (corroboration): принимаем баланс только когда >=2
-# независимые выборки (разные прокси) сходятся по total_usd. Случайный фантом
-# почти никогда не повторится → отбрасывается; стабильное реальное значение
-# подтверждается. Типовая цена — ~2 запроса на кошелёк.
-CORROBORATION_MIN_AGREE = 2        # сколько согласных выборок нужно для приёма
-CORROBORATION_TOL_PCT = 0.02       # относительный допуск (2%)
-CORROBORATION_TOL_ABS = 1.0        # абсолютный допуск ($1) — для мелких балансов
-CORROBORATION_MAX_FETCHES = 5      # бюджет УСПЕШНЫХ выборок на кошелёк
+# ВАЖНО (скорость): корроборация делается на ДЕШЁВОМ запросе total_balance
+# (1 HTTP-запрос), а тяжёлый token_list запрашивается ОДИН раз и только для
+# уже подтверждённого снимка. Раньше каждая выборка тянула total_balance +
+# token_list по каждой сети (1+N запросов) × минимум 2 выборки.
+CORROBORATION_MIN_AGREE = 2
+CORROBORATION_TOL_PCT = 0.02
+CORROBORATION_TOL_ABS = 1.0
+CORROBORATION_MAX_FETCHES = 5
+
+# Пул для «внутренней» параллельности одного кошелька: две первые проверки
+# идут одновременно, токены по сетям — тоже параллельно.
+_IO_POOL = ThreadPoolExecutor(max_workers=256, thread_name_prefix="evm-io")
+# Ниже этой суммы token_list не запрашивается: детализация не нужна.
+TOKEN_DETAIL_MIN_USD = MIN_VALUE_DISPLAY
 
 
 def _asset_value_usd(token: dict) -> float:
@@ -36,7 +43,7 @@ def _asset_value_usd(token: dict) -> float:
 
 
 def _is_native_asset(token: dict) -> bool:
-    """DeBank marks ERC-20 balances with a hex token id; native assets use the chain key."""
+    """Нативные активы: id == ключ сети (не hex), контракт пустой/нулевой."""
     token_id = str(token.get("id", "") or "").lower()
     contract = str(token.get("contract_address", "") or "").lower()
     if contract and contract != ZERO_ADDR:
@@ -44,24 +51,69 @@ def _is_native_asset(token: dict) -> bool:
     return not token_id.startswith("0x")
 
 
-def _fetch_snapshot(address: str, proxy_url: str) -> dict:
-    """Одна независимая выборка кошелька через DeBank (один прокси/сессия).
+def _cheap_probe(address: str, proxy_url: str) -> dict:
+    """Одна независимая ДЕШЁВАЯ выборка: total_usd + разбивка по сетям.
 
-    Возвращает «снимок» {total_usd, tokens}. Токены и total_usd берутся в рамках
-    одного клиента, поэтому относятся к одному и тому же ответу API.
+    Один HTTP-запрос (Rabby ``/v1/user/total_balance``). Сессия
+    переиспользуется на прокси в рамках потока → без TLS handshake.
     """
-    client = DeBankClient(proxy=proxy_url)
-    tokens = client.get_tokens(address)
-    total_usd = client.get_total_usd(address)
-    try:
-        total_usd = float(total_usd or 0.0)
-    except (TypeError, ValueError):
-        total_usd = 0.0
-    return {"total_usd": total_usd, "tokens": tokens if isinstance(tokens, list) else []}
+    client = get_balance_client(proxy_url)
+    fetch = getattr(client, "fetch_total_balance", None)
+    if fetch is not None:                      # Rabby (быстрый путь)
+        payload = fetch(address)
+        try:
+            total = float(payload.get("total_usd_value") or 0.0)
+        except (TypeError, ValueError):
+            total = 0.0
+        chain_list = payload.get("chain_list") or []
+    else:                                      # DeBank (fallback-источник)
+        try:
+            total = float(client.get_total_usd(address) or 0.0)
+        except (TypeError, ValueError):
+            total = 0.0
+        chain_list = []
+    return {"total_usd": total, "chain_list": chain_list, "proxy": proxy_url}
+
+
+def _fetch_tokens(address: str, snapshot: dict) -> list:
+    """Токены подтверждённого снимка. Сети — параллельно, пустые пропускаются."""
+    proxy_url = snapshot["proxy"]
+    client = get_balance_client(proxy_url)
+    get_token_list = getattr(client, "get_token_list", None)
+    if get_token_list is None:                 # DeBank: один запрос на всё
+        try:
+            tokens = client.get_tokens(address)
+        except Exception:
+            return []
+        return tokens if isinstance(tokens, list) else []
+
+    chains = [
+        c.get("id") for c in snapshot.get("chain_list", [])
+        if isinstance(c, dict) and c.get("id")
+        and (c.get("usd_value") or 0) > TOKEN_DETAIL_MIN_USD
+    ]
+    if not chains:
+        return []
+    if len(chains) == 1:
+        try:
+            return get_token_list(address, chains[0])
+        except Exception:
+            return []
+
+    # Параллельно по сетям — каждый поток берёт свою сессию из кэша.
+    def _one(chain_id: str) -> list:
+        try:
+            return get_balance_client(proxy_url).get_token_list(address, chain_id)
+        except Exception:
+            return []
+
+    tokens: list = []
+    for part in _IO_POOL.map(_one, chains):
+        tokens.extend(part or [])
+    return tokens
 
 
 def _values_agree(a: float, b: float) -> bool:
-    """Согласованы ли два знач.total_usd в пределах абсолютного ИЛИ относительного допуска."""
     diff = abs(a - b)
     if diff <= CORROBORATION_TOL_ABS:
         return True
@@ -69,10 +121,6 @@ def _values_agree(a: float, b: float) -> bool:
 
 
 def _agreeing_cluster(snapshots: list[dict]) -> list[dict] | None:
-    """Наибольший кластер согласных по total_usd выборок (размером >= MIN_AGREE).
-
-    Возвращает None, пока ни один кластер не набрал нужного числа подтверждений.
-    """
     best: list[dict] | None = None
     for anchor in snapshots:
         cluster = [s for s in snapshots if _values_agree(s["total_usd"], anchor["total_usd"])]
@@ -82,23 +130,15 @@ def _agreeing_cluster(snapshots: list[dict]) -> list[dict] | None:
 
 
 def _representative(cluster: list[dict]) -> dict:
-    """Из согласного кластера берём выборку с медианным total_usd (стабильный выбор)."""
     ordered = sorted(cluster, key=lambda s: s["total_usd"])
     return ordered[len(ordered) // 2]
 
 
 def _conservative_pick(snapshots: list[dict]) -> dict:
-    """Бюджет исчерпан без согласия → консервативный выбор.
-
-    Берём выборку с наименьшим total_usd: это исключает раздувание фантомом
-    (фантом почти всегда крупнее реального мелкого баланса).
-    """
     return min(snapshots, key=lambda s: s["total_usd"])
 
 
-def _build_result(address: str, snapshot: dict, corroborated: bool) -> Result:
-    """Строит Result.OK из выбранного (подтверждённого) снимка."""
-    tokens = snapshot["tokens"]
+def _build_result(address: str, snapshot: dict, tokens: list, corroborated: bool) -> Result:
     total_usd = snapshot["total_usd"]
 
     tokens_data = [
@@ -114,27 +154,24 @@ def _build_result(address: str, snapshot: dict, corroborated: bool) -> Result:
     ]
     tokens_data.sort(key=lambda x: x["value"], reverse=True)
 
-    chains = sorted({t["chain"] for t in tokens_data})
+    # Сети и топ-сеть берём из chain_list снимка (уже есть, запросов не нужно).
+    chain_usd: dict[str, float] = {}
+    for c in snapshot.get("chain_list", []):
+        if isinstance(c, dict) and c.get("id") and (c.get("usd_value") or 0) > MIN_VALUE_DISPLAY:
+            chain_usd[str(c["id"])] = float(c.get("usd_value") or 0)
+    if not chain_usd:
+        for t in tokens_data:
+            chain_usd[t["chain"]] = chain_usd.get(t["chain"], 0) + t["value"]
 
-    # Native asset total (ETH, BNB, MATIC, etc.)
-    native_usd = round(sum(
-        _asset_value_usd(t) for t in tokens
-        if _is_native_asset(t)
-    ), 2)
-
-    top_tokens = ", ".join(
-        f"{t['symbol']}(${t['value']:.2f})" for t in tokens_data[:3]
-    )
-
-    # Value per chain for top_chain_usd
-    chain_totals: dict[str, float] = {}
-    for t in tokens_data:
-        chain_totals[t["chain"]] = chain_totals.get(t["chain"], 0) + t["value"]
-    if chain_totals:
-        best_chain = max(chain_totals, key=chain_totals.get)  # type: ignore[arg-type]
-        top_chain_usd = f"{best_chain}: ${chain_totals[best_chain]:.0f}"
+    chains = sorted(chain_usd)
+    if chain_usd:
+        best_chain = max(chain_usd, key=chain_usd.get)  # type: ignore[arg-type]
+        top_chain_usd = f"{best_chain}: ${chain_usd[best_chain]:.0f}"
     else:
         top_chain_usd = ""
+
+    native_usd = round(sum(_asset_value_usd(t) for t in tokens if _is_native_asset(t)), 2)
+    top_tokens = ", ".join(f"{t['symbol']}(${t['value']:.2f})" for t in tokens_data[:3])
 
     return Result(
         item=address,
@@ -156,42 +193,56 @@ def _check_wallet_sync(
     rotator: ProxyRotator,
     stop_event: threading.Event,
 ) -> Result:
-    """Sync функция для run_in_executor. Проверяет один кошелёк с подтверждением.
-
-    Делает независимые выборки (разные прокси), пока >=CORROBORATION_MIN_AGREE из
-    них не сойдутся по total_usd — это отсекает фантомные балансы DeBank,
-    возникающие при высокой параллельности. Сетевые ошибки не тратят бюджет
-    подтверждения (есть запас попыток).
-    """
+    """Проверка одного кошелька: дешёвая корроборация + один сбор токенов."""
     last_error: Exception | None = None
     snapshots: list[dict] = []
     attempts = 0
-    max_attempts = CORROBORATION_MAX_FETCHES + RETRY_ATTEMPTS  # запас на сетевые сбои
+    max_attempts = CORROBORATION_MAX_FETCHES + RETRY_ATTEMPTS
 
-    while attempts < max_attempts and len(snapshots) < CORROBORATION_MAX_FETCHES:
+    def _probe_with_next_proxy() -> dict:
+        proxy = rotator.next()
+        if proxy is None:
+            raise RuntimeError("Нет доступных прокси")
+        return _cheap_probe(address, proxy.to_url())
+
+    if rotator.is_empty():
+        return Result(item=address, status=ResultStatus.ERROR, error="Нет доступных прокси")
+
+    # Первые CORROBORATION_MIN_AGREE выборки — одновременно (экономия latency):
+    # часть уходит в пул, последняя выполняется в текущем потоке.
+    futures = [_IO_POOL.submit(_probe_with_next_proxy)
+               for _ in range(max(0, CORROBORATION_MIN_AGREE - 1))]
+    for run in [_probe_with_next_proxy] + [f.result for f in futures]:
+        attempts += 1
+        try:
+            snapshots.append(run())
+        except Exception as e:
+            last_error = e
+
+    while True:
         if stop_event.is_set():
             return Result(item=address, status=ResultStatus.ERROR, error="Stopped")
 
-        proxy = rotator.next()
-        if proxy is None:
-            return Result(item=address, status=ResultStatus.ERROR,
-                          error="Нет доступных прокси")
+        cluster = _agreeing_cluster(snapshots)
+        if cluster is not None:
+            snap = _representative(cluster)
+            tokens = _fetch_tokens(address, snap) if snap["total_usd"] > TOKEN_DETAIL_MIN_USD else []
+            return _build_result(address, snap, tokens, corroborated=True)
+
+        if attempts >= max_attempts or len(snapshots) >= CORROBORATION_MAX_FETCHES:
+            break
 
         attempts += 1
         try:
-            snap = _fetch_snapshot(address, proxy.to_url())
+            snapshots.append(_probe_with_next_proxy())
         except Exception as e:
             last_error = e
-            continue
 
-        snapshots.append(snap)
-        cluster = _agreeing_cluster(snapshots)
-        if cluster is not None:
-            return _build_result(address, _representative(cluster), corroborated=True)
-
-    # Бюджет исчерпан без согласия — консервативный выбор, помечаем непроверенным.
+    # Бюджет исчерпан без согласия — консервативный выбор, помечаем «⚠».
     if snapshots:
-        return _build_result(address, _conservative_pick(snapshots), corroborated=False)
+        snap = _conservative_pick(snapshots)
+        tokens = _fetch_tokens(address, snap) if snap["total_usd"] > TOKEN_DETAIL_MIN_USD else []
+        return _build_result(address, snap, tokens, corroborated=False)
 
     return Result(
         item=address,
@@ -201,8 +252,7 @@ def _check_wallet_sync(
 
 
 class _EvmSignals(QObject):
-    # _EvmSignals создаётся в __init__ (main thread) — никогда не создавать в run()!
-    # Это обеспечивает Qt thread affinity для корректной queued-доставки из worker thread.
+    # Создаётся в __init__ (main thread) — никогда не в run()!
     run_complete = Signal(list, dict)
 
 
@@ -234,7 +284,6 @@ class EvmBalanceCheckerModule(BaseModule):
         return self._widget
 
     def get_item_count(self) -> int:
-        """Для прогресс-бара MainWindow."""
         return len(self._widget.get_wallets())
 
     def get_results(self) -> list[Result]:
@@ -248,13 +297,21 @@ class EvmBalanceCheckerModule(BaseModule):
         wallets = self._widget.get_wallets()
         proxies = self._widget.get_proxies()
         rotator = ProxyRotator(proxies)
-        semaphore = asyncio.Semaphore(ctx.concurrency)
+
+        # Параллельность: ограничение — сеть, не CPU. Раньше использовался
+        # дефолтный executor (max ~12-32 потока), и он был узким горлышком
+        # независимо от ctx.concurrency. Теперь пул сразу под нужный размер.
+        concurrency = max(1, min(int(ctx.concurrency or 16), 200, max(1, len(wallets))))
+        semaphore = asyncio.Semaphore(concurrency)
         loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="evm-wallet")
 
         async def _indexed_check(idx: int, addr: str) -> tuple[int, Result]:
             async with semaphore:
+                if self._stop_event.is_set():
+                    return idx, Result(item=addr, status=ResultStatus.ERROR, error="Stopped")
                 result = await loop.run_in_executor(
-                    None, _check_wallet_sync, addr, rotator, self._stop_event
+                    executor, _check_wallet_sync, addr, rotator, self._stop_event
                 )
                 return idx, result
 
@@ -277,6 +334,7 @@ class EvmBalanceCheckerModule(BaseModule):
                     yield r
                     next_idx += 1
         finally:
+            executor.shutdown(wait=False, cancel_futures=True)
             self._signals.run_complete.emit(list(self._results), dict(self._details))
 
     async def stop(self) -> None:

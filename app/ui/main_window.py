@@ -19,6 +19,18 @@ from app.ui.widgets.toast import show_toast
 from app.i18n import i18n, tr
 
 
+def _pick_concurrency(proxy_count: int) -> int:
+    """Параллельность прогона.
+
+    Один прокси спокойно держит несколько одновременных запросов, поэтому
+    берём кратность 3 от числа прокси (ранее было 1:1 — главный тормоз),
+    с разумным потолком, чтобы не ловить 429/бан.
+    """
+    if proxy_count <= 0:
+        return 16
+    return max(8, min(proxy_count * 3, 120))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, registry: ModuleRegistry) -> None:
         super().__init__()
@@ -282,6 +294,8 @@ class MainWindow(QMainWindow):
         if self._current_module is not None:
             self._results_cache[id(self._current_module)] = self._results_table.snapshot()
         self._current_module = module
+        # Схема колонок модуля — до restore/clear, чтобы кэш строк лёг в свои колонки
+        self._results_table.set_schema(module.column_schema())
         cached = self._results_cache.get(id(module))
         if cached:
             self._results_table.restore(cached)
@@ -348,6 +362,7 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(True)
 
         self._sidebar.set_module_status(self._current_module, "running")
+        self._sidebar.clear_module_progress(self._current_module)
 
         self._done_count = 0
         self._total_count = self._current_module.get_item_count()
@@ -370,7 +385,7 @@ class MainWindow(QMainWindow):
             items=[],
             proxies=proxies,
             rpc_urls=[],
-            concurrency=min(len(proxies), 50) if proxies else 10,
+            concurrency=_pick_concurrency(len(proxies)),
         )
         logger = Logger(on_log_signal=self._task_runner.on_log)
         ctx.extra["logger"] = logger

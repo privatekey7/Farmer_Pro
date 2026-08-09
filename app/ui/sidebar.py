@@ -43,6 +43,8 @@ class _SidebarButton(QPushButton):
 
         self.setText(module.name)
         self._status: str = ""  # "", "running", "done", "error"
+        self._progress: float = 0.0   # 0.0..1.0, -1 = нет прогресса
+        self._has_progress: bool = False
 
     def set_status(self, status: str) -> None:
         self._status = status
@@ -51,8 +53,42 @@ class _SidebarButton(QPushButton):
         self.style().polish(self)
         self.update()
 
+    def set_progress(self, done: int, total: int) -> None:
+        """Показывает полосу прогресса внизу кнопки. total<=0 — прогресс скрыт."""
+        if total and total > 0:
+            frac = max(0.0, min(1.0, done / total))
+            # Перерисовываем только при заметном изменении (экономия CPU на UI-потоке)
+            if self._has_progress and abs(frac - self._progress) < 0.005 and frac < 1.0:
+                return
+            self._progress = frac
+            self._has_progress = True
+        else:
+            if not self._has_progress:
+                return
+            self._progress = 0.0
+            self._has_progress = False
+        self.update()
+
+    def clear_progress(self) -> None:
+        self.set_progress(0, 0)
+
     def paintEvent(self, event):
         super().paintEvent(event)
+        if self._has_progress:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            h = 3
+            y = self.height() - h - 2
+            x0, w = 8, max(0, self.width() - 16)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 38))
+            painter.drawRoundedRect(x0, y, w, h, 1.5, 1.5)
+            fill = int(w * self._progress)
+            if fill > 0:
+                color = QColor("#30D158") if self._progress >= 1.0 else QColor("#0A84FF")
+                painter.setBrush(color)
+                painter.drawRoundedRect(x0, y, fill, h, 1.5, 1.5)
+            painter.end()
         if not self._status:
             return
         painter = QPainter(self)
@@ -150,6 +186,19 @@ class Sidebar(QWidget):
             if btn.module is module:
                 btn.set_status(status)
                 break
+
+    def set_module_progress(self, module: BaseModule, done: int, total: int) -> None:
+        """Живой прогресс модуля в сайдбаре (вызывается из UI-потока)."""
+        for btn in self._buttons:
+            if btn.module is module:
+                btn.set_progress(done, total)
+                break
+
+    def clear_module_progress(self, module: BaseModule | None = None) -> None:
+        """Сбрасывает прогресс одного модуля или всех сразу."""
+        for btn in self._buttons:
+            if module is None or btn.module is module:
+                btn.clear_progress()
 
     def select_module(self, index: int) -> None:
         """Programmatically select a module by index."""

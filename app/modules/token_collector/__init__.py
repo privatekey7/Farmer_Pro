@@ -10,7 +10,7 @@ from PySide6.QtCore import QObject, Signal
 
 from app.core.base_module import BaseModule
 from app.core.models import RunContext, Result, ResultStatus, ColumnDef
-from app.integrations.debank_client import DeBankClient
+from app.integrations.balance_client import create_balance_client
 from app.integrations.lifi_client import (
     LiFiClient, DEBANK_TO_CHAIN_ID, LiFiChainRegistry,
 )
@@ -215,7 +215,7 @@ class CollectorModule(BaseModule):
 
                 proxy = rotator.next()
                 proxy_url = proxy.to_url() if proxy else None
-                debank_client = DeBankClient(proxy=proxy_url or "http://127.0.0.1:8080")
+                balance_client = create_balance_client(proxy=proxy_url or "http://127.0.0.1:8080")
 
                 result_data: dict = {}
                 bridge_tx: str | None = None
@@ -225,11 +225,11 @@ class CollectorModule(BaseModule):
                 total_sent_usd = 0.0
 
                 try:
-                    # ШАГ 1-2: DeBank + swap
+                    # ШАГ 1-2: балансы (Rabby/DeBank) + swap
                     swap_result = await fetch_and_swap(
                         wallet=wallet,
                         lifi_client=lifi_client,
-                        debank_client=debank_client,
+                        balance_client=balance_client,
                         rpc_resolver=rpc_resolver,
                         settings=settings,
                         native_token_by_id=native_token_by_id,

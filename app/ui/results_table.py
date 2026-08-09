@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
-from app.core.models import Result, ResultStatus
+from app.core.models import Result, ResultStatus, ColumnDef
 from app.storage.exporters import get_columns, CsvExporter, JsonExporter, XlsxExporter
 from app.ui.widgets.empty_state import EmptyState
 from app.i18n import tr, i18n
@@ -35,6 +35,7 @@ class ResultsTable(QWidget):
         super().__init__(parent)
         self._results: list[Result] = []
         self._columns: list[str] = ["item", "status"]
+        self._schema: dict[str, ColumnDef] = {}
 
         # Search bar
         self._search = QLineEdit()
@@ -117,11 +118,51 @@ class ResultsTable(QWidget):
             subtitle=tr("empty_results_subtitle"),
         )
 
+    def set_schema(self, schema: list[ColumnDef]) -> None:
+        """Применяет схему колонок модуля (порядок, заголовки, ширины, формат).
+
+        Пустой список сбрасывает схему — колонки выводятся из result.data
+        (legacy-поведение). Вызывать до добавления строк (после clear_results
+        или перед restore).
+        """
+        visible = [c for c in schema if c.visible]
+        if not visible:
+            self._schema = {}
+            self._columns = ["item", "status"]
+            self._table.setColumnCount(0)
+            return
+        self._schema = {c.key: c for c in visible}
+        self._columns = [c.key for c in visible]
+        self._table.setColumnCount(len(visible))
+        self._table.setHorizontalHeaderLabels([c.label for c in visible])
+        header = self._table.horizontalHeader()
+        for idx, col in enumerate(visible):
+            if col.width > 0:
+                header.setSectionResizeMode(idx, QHeaderView.Interactive)
+                self._table.setColumnWidth(idx, col.width)
+            else:
+                header.setSectionResizeMode(idx, QHeaderView.Stretch)
+
+    def _format_cell(self, key: str, value) -> str:
+        """Форматирует значение по fmt из схемы; при ошибке — как есть."""
+        if value is None or value == "":
+            return ""
+        col = self._schema.get(key)
+        if col is not None and col.fmt:
+            try:
+                return col.fmt.format(value)
+            except (ValueError, TypeError):
+                pass
+        return str(value)
+
     def add_row(self, result: Result) -> None:
         self._results.append(result)
         self._stack.setCurrentIndex(1)  # show table
 
-        if not self._table.columnCount() or (result.data and self._columns == ["item", "status"]):
+        if not self._schema and (
+            not self._table.columnCount()
+            or (result.data and self._columns == ["item", "status"])
+        ):
             self._columns = get_columns(self._results)
             self._table.setColumnCount(len(self._columns))
             self._table.setHorizontalHeaderLabels(self._columns)
@@ -132,7 +173,7 @@ class ResultsTable(QWidget):
         row_data.update(result.data)
 
         for col_idx, col in enumerate(self._columns):
-            cell_text = str(row_data.get(col, ""))
+            cell_text = self._format_cell(col, row_data.get(col, ""))
             item = QTableWidgetItem(cell_text)
             item.setTextAlignment(Qt.AlignCenter)
 
@@ -187,8 +228,10 @@ class ResultsTable(QWidget):
     def clear_results(self) -> None:
         self._results.clear()
         self._table.setRowCount(0)
-        self._table.setColumnCount(0)
-        self._columns = ["item", "status"]
+        if not self._schema:
+            # Legacy-режим: колонки выводятся заново из result.data
+            self._table.setColumnCount(0)
+            self._columns = ["item", "status"]
         self._quality_filter.setCurrentIndex(0)
         self._quality_filter.setVisible(False)
         self._export_csv.setVisible(False)
