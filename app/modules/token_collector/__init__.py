@@ -225,7 +225,7 @@ class CollectorModule(BaseModule):
                 total_sent_usd = 0.0
 
                 try:
-                    # ШАГ 1-2: балансы (Rabby/DeBank) + swap
+                    # ШАГ 1-2: балансы (Rabby) + swap
                     swap_result = await fetch_and_swap(
                         wallet=wallet,
                         lifi_client=lifi_client,

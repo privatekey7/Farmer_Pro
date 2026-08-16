@@ -12,12 +12,14 @@ logger = logging.getLogger(__name__)
 
 
 # ── Anti-phantom corroboration (см. evm_balance_checker) ───────────────────
-# Под высокой параллельной нагрузкой DeBank ~1/30 отдаёт портфель ЧУЖОГО адреса.
-# Ответ внутренне согласован (реальные токены), поэтому одиночная выборка фантом
-# не ловит. Особенность: истинный набор токенов СТАБИЛЕН между запросами,
-# фантом — СЛУЧАЕН и не повторяется. Принимаем список только когда >=2
-# независимые выборки сходятся по суммарному total_usd; иначе — консервативно
-# (наименьший total_usd), чтобы не раздувать своп фантомными токенами. ~2 запр./кошелёк.
+# Исторически DeBank под высокой параллельной нагрузкой ~1/30 отдал портфель
+# ЧУЖОГО адреса; ответ внутренне согласован (реальные токены), поэтому одиночная
+# выборка фантом не ловит. Источник заменён на Rabby (готовый агрегат
+# total_balance), но корроборация оставлена как страховка: истинный набор
+# токенов СТАБИЛЕН между запросами, фантом — СЛУЧАЕН и не повторяется.
+# Принимаем список только когда >=2 независимые выборки сходятся по суммарному
+# total_usd; иначе — консервативно (наименьший total_usd), чтобы не раздувать
+# своп фантомными токенами. ~2-3 запр./кошелёк.
 COLLECTOR_CORROBORATION_MIN_AGREE = 2     # сколько согласных выборок нужно
 COLLECTOR_CORROBORATION_TOL_PCT = 0.02    # относительный допуск (2%)
 COLLECTOR_CORROBORATION_TOL_ABS = 1.0     # абсолютный допуск ($1) — для мелких балансов
@@ -25,7 +27,7 @@ COLLECTOR_CORROBORATION_MAX_FETCHES = 5   # бюджет УСПЕШНЫХ выб
 
 
 def _tokens_total_usd(tokens: Any) -> float:
-    """Суммарная USD-стоимость списка токенов DeBank (price * amount)."""
+    """Суммарная USD-стоимость списка токенов Rabby (price * amount)."""
     if not isinstance(tokens, list):
         return 0.0
     total = 0.0
@@ -86,7 +88,7 @@ def _get_native_addr(
 def _resolve_contract(token: dict) -> str:
     """
     Возвращает адрес контракта токена.
-    DeBank API не возвращает поле contract_address — контракт ERC-20 хранится в поле id.
+    Rabby API не возвращает поле contract_address — контракт ERC-20 хранится в поле id.
     Для нативных токенов id = ключ цепи (не hex), поэтому проверяем startswith("0x").
     """
     token_id = token.get("id", "")
@@ -209,7 +211,7 @@ async def _estimate_swap_tx_cost(
 async def fetch_and_swap(
     wallet: dict,                               # {"raw": "0x...", "type": "private_key"}
     lifi_client: Any,                           # LiFiClient
-    balance_client: Any,                        # BalanceClient (Rabby/DeBank)
+    balance_client: Any,                        # RabbyClient
     rpc_resolver: Any,                          # RpcResolver
     settings: Any,                              # CollectorSettings
     native_token_by_id: dict[int, dict],
@@ -220,7 +222,7 @@ async def fetch_and_swap(
     target_chain_ids: set[int] | None = None,   # исключаем таргет-цепи из total_usd
 ) -> dict:
     """
-    ШАГ 1-2: получить балансы (Rabby/DeBank по BALANCE_SOURCE), отфильтровать,
+    ШАГ 1-2: получить балансы (Rabby API), отфильтровать,
     своп не-нативных токенов в нативный через LI.FI.
     Возвращает статистику: chains_processed, chains_skipped, tokens_swapped, total_usd.
     """
@@ -230,14 +232,15 @@ async def fetch_and_swap(
     address, private_key = derive_address(wallet["raw"], wallet["type"])
     loop = asyncio.get_running_loop()
 
-    # ШАГ 1: Получить балансы с подтверждением против фантомов DeBank.
-    # Принимаем список токенов только когда >=2 независимые выборки сошлись по
-    # суммарному total_usd (случайный фантом почти никогда не повторяется).
-    DEBANK_RETRY = 10
+    # ШАГ 1: Получить балансы с корроборацией против фантомов (см. блок
+    # констант выше). Принимаем список токенов только когда >=2 независимые
+    # выборки сошлись по суммарному total_usd (случайный фантом почти
+    # никогда не повторяется).
+    BALANCE_RETRY = 10
     snapshots: list[dict] = []          # [{"total_usd": float, "tokens": list}]
     last_exc: Exception | None = None
     attempts = 0
-    max_attempts = COLLECTOR_CORROBORATION_MAX_FETCHES + DEBANK_RETRY  # запас на сетевые сбои
+    max_attempts = COLLECTOR_CORROBORATION_MAX_FETCHES + BALANCE_RETRY  # запас на сетевые сбои
     corroborated = False
     tokens: list[dict] = []
 
@@ -263,11 +266,11 @@ async def fetch_and_swap(
 
     if not corroborated:
         if not snapshots:
-            logger.error("[%s] DeBank failed after %d attempts: %s", address[:10], attempts, last_exc)
+            logger.error("[%s] Rabby failed after %d attempts: %s", address[:10], attempts, last_exc)
             return {}
         tokens = _conservative_pick(snapshots)["tokens"]
         logger.warning(
-            "[Wallet %s] DeBank balances NOT corroborated after %d fetches "
+            "[Wallet %s] Rabby balances NOT corroborated after %d fetches "
             "(no >=%d agreement on total_usd) — берём консервативный снимок ($%.2f); "
             "возможен фантом, своп идёт только по on-chain balanceOf",
             address[:10], len(snapshots), COLLECTOR_CORROBORATION_MIN_AGREE,
@@ -353,7 +356,7 @@ async def fetch_and_swap(
             contract = _resolve_contract(token)
             decimals = token.get("decimals", 18)
 
-            # Получаем w3 и реальный on-chain баланс — DeBank-кэш может быть устаревшим
+            # Получаем w3 и реальный on-chain баланс — кэш Rabby может быть устаревшим
             try:
                 w3 = rpc_resolver.get_web3(chain_id)
             except Exception as e:
@@ -381,7 +384,7 @@ async def fetch_and_swap(
                     w3 = rpc_resolver.rotate(chain_id)
                     from_amount = await _get_balance(w3)
                 except Exception as e2:
-                    logger.warning("[Wallet %s] [%s] balanceOf failed for %s, using DeBank amount: %s",
+                    logger.warning("[Wallet %s] [%s] balanceOf failed for %s, using API amount: %s",
                                    address[:10], debank_key, symbol, e2)
                     amount = token.get("amount", 0)
                     from_amount = int(Decimal(str(amount)) * Decimal(10 ** decimals))
@@ -590,7 +593,7 @@ async def retry_gasless_swaps(
 ) -> dict:
     """
     ШАГ 2.6: повторный своп токенов на цепях, которые были рефьюелены.
-    Не вызывает DeBank — использует список токенов из gasless_chains.
+    Не вызывает Rabby — использует список токенов из gasless_chains.
     Возвращает {chains_processed, tokens_swapped, total_usd}.
     """
     from app.integrations.lifi_client import DEBANK_TO_CHAIN_ID, LiFiNoRouteError
