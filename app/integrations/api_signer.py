@@ -6,13 +6,12 @@ import random
 import time
 from typing import TypedDict
 
-"""Подпись запросов к DeBank/Rabby API (HMAC-SHA256).
+"""Подпись запросов к Rabby API (HMAC-SHA256).
 
-Алгоритм идентичен у обоих сервисов, отличается только префикс строки ключа
-(``debank-api`` / ``rabby-api``) — проверено воспроизведением подписи из HAR
-веб-версий байт-в-байт:
+Проверено воспроизведением подписи из HAR клиента Rabby байт-в-байт
+(tests/test_api_signer.py):
 
-    K    = sha256("{prefix}\\n{nonce}\\n{ts}")
+    K    = sha256("rabby-api\\n{nonce}\\n{ts}")
     M    = sha256("{METHOD}\\n{path}\\n{отсортированные по ключу query-параметры}")
     sign = HMAC-SHA256(key=K, msg=M)
 """
@@ -20,7 +19,6 @@ from typing import TypedDict
 NONCE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXTZabcdefghiklmnopqrstuvwxyz"
 NONCE_LENGTH = 40
 
-DEBANK_SIGN_PREFIX = "debank-api"
 RABBY_SIGN_PREFIX = "rabby-api"
 
 
@@ -57,7 +55,7 @@ def sign_request(
     params: dict,
     method: str,
     path: str,
-    prefix: str = DEBANK_SIGN_PREFIX,
+    prefix: str = RABBY_SIGN_PREFIX,
     nonce: str | None = None,
     ts: int | None = None,
     version: str = "v2",
@@ -65,9 +63,8 @@ def sign_request(
     """Подпись запроса. ``nonce``/``ts`` передаются явно только в тестах."""
     ts = ts or int(time.time())
     nonce = nonce or generate_nonce()
-    key_prefix = "debank-web" if version == "v2.1" else prefix
     sorted_p = sort_params(params)
-    key = sha256_hex(f"{key_prefix}\n{nonce}\n{ts}")
+    key = sha256_hex(f"{prefix}\n{nonce}\n{ts}")
     msg = sha256_hex(f"{method.upper()}\n{path}\n{sorted_p}")
     signature = hmac_sha256(key, msg)
     return {"signature": signature, "nonce": nonce, "ts": ts, "version": version}

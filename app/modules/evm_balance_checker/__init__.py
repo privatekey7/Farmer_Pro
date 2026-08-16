@@ -57,35 +57,28 @@ def _cheap_probe(address: str, proxy_url: str) -> dict:
     Один HTTP-запрос (Rabby ``/v1/user/total_balance``). Сессия
     переиспользуется на прокси в рамках потока → без TLS handshake.
     """
-    client = get_balance_client(proxy_url)
-    fetch = getattr(client, "fetch_total_balance", None)
-    if fetch is not None:                      # Rabby (быстрый путь)
-        payload = fetch(address)
-        try:
-            total = float(payload.get("total_usd_value") or 0.0)
-        except (TypeError, ValueError):
-            total = 0.0
-        chain_list = payload.get("chain_list") or []
-    else:                                      # DeBank (fallback-источник)
-        try:
-            total = float(client.get_total_usd(address) or 0.0)
-        except (TypeError, ValueError):
-            total = 0.0
-        chain_list = []
-    return {"total_usd": total, "chain_list": chain_list, "proxy": proxy_url}
+    payload = get_balance_client(proxy_url).fetch_total_balance(address)
+    try:
+        total = float(payload.get("total_usd_value") or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    return {
+        "total_usd": total,
+        "chain_list": payload.get("chain_list") or [],
+        "proxy": proxy_url,
+    }
 
 
 def _fetch_tokens(address: str, snapshot: dict) -> list:
-    """Токены подтверждённого снимка. Сети — параллельно, пустые пропускаются."""
+    """Токены подтверждённого снимка: все сети ОДНИМ запросом.
+
+    ``cache_token_list`` покрывает все сети сразу; серийный ``token_list``
+    (по запросу на сеть) душится анти-ботом Rabby фейковым 429. При сбое
+    кэша — фолбэк по-сетевым ``token_list`` (параллельно, пустые сети
+    пропускаются).
+    """
     proxy_url = snapshot["proxy"]
     client = get_balance_client(proxy_url)
-    get_token_list = getattr(client, "get_token_list", None)
-    if get_token_list is None:                 # DeBank: один запрос на всё
-        try:
-            tokens = client.get_tokens(address)
-        except Exception:
-            return []
-        return tokens if isinstance(tokens, list) else []
 
     chains = [
         c.get("id") for c in snapshot.get("chain_list", [])
@@ -94,6 +87,11 @@ def _fetch_tokens(address: str, snapshot: dict) -> list:
     ]
     if not chains:
         return []
+    try:
+        return client.get_cache_token_list(address)
+    except Exception:
+        pass                                   # фолбэк — ниже
+
     if len(chains) == 1:
         try:
             return get_token_list(address, chains[0])

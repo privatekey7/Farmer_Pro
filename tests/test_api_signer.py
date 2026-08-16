@@ -1,11 +1,10 @@
 # tests/test_api_signer.py
-"""Подпись DeBank/Rabby: воспроизведение реальных подписей из HAR байт-в-байт."""
+"""Подпись Rabby: воспроизведение реальных подписей из HAR байт-в-байт."""
 from __future__ import annotations
 import re
 import time
 
 from app.integrations.api_signer import (
-    DEBANK_SIGN_PREFIX,
     RABBY_SIGN_PREFIX,
     generate_nonce,
     sign_request,
@@ -65,16 +64,15 @@ def test_param_order_does_not_change_signature():
 
 
 def test_prefix_changes_signature():
-    rabby = sign_request({"id": "0xabc"}, "GET", "/x",
-                         prefix=RABBY_SIGN_PREFIX, nonce="n_test", ts=1000)
-    debank = sign_request({"id": "0xabc"}, "GET", "/x",
-                          prefix=DEBANK_SIGN_PREFIX, nonce="n_test", ts=1000)
-    assert rabby["signature"] != debank["signature"]
+    default = sign_request({"id": "0xabc"}, "GET", "/x", nonce="n_test", ts=1000)
+    other = sign_request({"id": "0xabc"}, "GET", "/x",
+                         prefix="other-api", nonce="n_test", ts=1000)
+    assert default["signature"] != other["signature"]
 
 
-def test_default_prefix_is_debank():
+def test_default_prefix_is_rabby():
     explicit = sign_request({}, "GET", "/x",
-                            prefix=DEBANK_SIGN_PREFIX, nonce="n_test", ts=1000)
+                            prefix=RABBY_SIGN_PREFIX, nonce="n_test", ts=1000)
     default = sign_request({}, "GET", "/x", nonce="n_test", ts=1000)
     assert default["signature"] == explicit["signature"]
 
