@@ -1,7 +1,10 @@
 from __future__ import annotations
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator
+
+import httpx
 
 from PySide6.QtCore import QObject, Signal
 
@@ -11,6 +14,9 @@ from app.integrations.proxy_utils import ProxyRotator
 from app.integrations.solana_rpc import SolanaClient
 
 RETRY_ATTEMPTS = 3
+# Прокси, к которому не удалось подключиться (407, таймаут подключения),
+# на это время исключается из ротации — следующие кошельки его не ждут.
+DEAD_PROXY_COOLDOWN_SEC = 300
 MIN_VALUE_DISPLAY = 0.01
 
 
@@ -52,6 +58,8 @@ def _check_wallet_sync(
             )
         except Exception as e:
             last_error = e
+            if isinstance(e, (httpx.ProxyError, httpx.ConnectTimeout, httpx.ConnectError)):
+                rotator.cooldown(proxy.to_url(), DEAD_PROXY_COOLDOWN_SEC)
 
     return Result(
         item=address,
@@ -106,13 +114,17 @@ class SvmBalanceCheckerModule(BaseModule):
         rpc_url = self._widget.get_rpc_url()
         # ctx.rpc_urls is intentionally ignored — RPC URL is widget-sourced
         rotator = ProxyRotator(proxies)
-        semaphore = asyncio.Semaphore(ctx.concurrency)
+        # Свой пул под размер прогона: дефолтный executor (≤32 потоков)
+        # ограничивал параллельность независимо от ctx.concurrency.
+        concurrency = max(1, min(int(ctx.concurrency or 16), 200, max(1, len(wallets))))
+        semaphore = asyncio.Semaphore(concurrency)
         loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="svm-wallet")
 
         async def _indexed_check(idx: int, addr: str) -> tuple[int, Result]:
             async with semaphore:
                 result = await loop.run_in_executor(
-                    None, _check_wallet_sync, addr, rotator, rpc_url, self._stop_event
+                    executor, _check_wallet_sync, addr, rotator, rpc_url, self._stop_event
                 )
                 return idx, result
 
@@ -123,6 +135,7 @@ class SvmBalanceCheckerModule(BaseModule):
         try:
             for fut in asyncio.as_completed(tasks):
                 if self._stop_event.is_set():
+                    fut.close()  # as_completed yields coroutines; close unawaited one
                     for t in tasks:
                         t.cancel()
                     break
@@ -136,6 +149,7 @@ class SvmBalanceCheckerModule(BaseModule):
                     yield r
                     next_idx += 1
         finally:
+            executor.shutdown(wait=False, cancel_futures=True)
             self._signals.run_complete.emit(list(self._results), dict(self._details))
 
     async def stop(self) -> None:

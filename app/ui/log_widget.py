@@ -37,10 +37,12 @@ class LogWidget(QWidget):
         self._btn_info = QPushButton("Info")
         self._btn_warn = QPushButton("Warn")
         self._btn_error = QPushButton("Error")
+        self._btn_success = QPushButton("Success")
 
         for btn, filt in [
             (self._btn_all, "all"),
             (self._btn_info, "info"),
+            (self._btn_success, "success"),
             (self._btn_warn, "warn"),
             (self._btn_error, "error"),
         ]:
@@ -153,6 +155,7 @@ class LogWidget(QWidget):
         for btn, f in [
             (self._btn_all, "all"),
             (self._btn_info, "info"),
+            (self._btn_success, "success"),
             (self._btn_warn, "warn"),
             (self._btn_error, "error"),
         ]:

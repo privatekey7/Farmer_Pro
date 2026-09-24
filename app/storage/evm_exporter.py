@@ -41,6 +41,19 @@ def _match_token(t: dict, flt: tuple[str, str] | None) -> bool:
     return True
 
 
+def _total(results: list[Result]) -> dict:
+    """Общий баланс: только подтверждённые (OK) кошельки — UNVERIFIED не
+    подтверждены и в сумму не входят (как в таблице и в DeBankChecker)."""
+    ok = [r for r in results if r.status.value == "ok"]
+    return {
+        "sum_usd":       round(sum(r.data.get("total_usd", 0) or 0 for r in ok), 2),
+        "tokens_usd":    round(sum(r.data.get("tokens_usd", 0) or 0 for r in ok), 2),
+        "protocols_usd": round(sum(r.data.get("protocols_usd", 0) or 0 for r in ok), 2),
+        "ok_count":      len(ok),
+        "total_count":   len(results),
+    }
+
+
 class EvmExporter:
     """Строит и экспортирует данные EVM Balance по конфигурации."""
 
@@ -49,16 +62,20 @@ class EvmExporter:
         results: list[Result],
         details: dict[str, dict],
         config: EvmExportConfig,
-    ) -> dict[str, list[dict]]:
+    ) -> dict:
         tok_flt = _parse_filter(config.token_filter)
-        data: dict[str, list[dict]] = {"summary": [], "tokens": []}
+        data: dict = {"total": _total(results), "summary": [], "tokens": []}
 
         for r in results:
             if config.summary:
+                # Суммы — только у подтверждённых (OK): у UNVERIFIED значение
+                # не подтверждено и в экспорт не пишется (как в DeBankChecker).
+                verified = r.status.value == "ok"
                 data["summary"].append({
                     "address":    r.item,
-                    "total_usd":  r.data.get("total_usd", ""),
-                    "tokens_usd": r.data.get("tokens_usd", ""),
+                    "total_usd":  r.data.get("total_usd", "") if verified else "",
+                    "tokens_usd": r.data.get("tokens_usd", "") if verified else "",
+                    "protocols_usd": r.data.get("protocols_usd", "") if verified else "",
                     "tokens":     r.data.get("tokens", ""),
                     "chains":     r.data.get("chains", ""),
                     "status":     r.status.value,
@@ -101,7 +118,7 @@ class EvmExporter:
     # --- CSV ---
 
     _SECTION_COLUMNS = {
-        "summary": ["address", "total_usd", "tokens_usd", "tokens", "chains", "status"],
+        "summary": ["address", "total_usd", "tokens_usd", "protocols_usd", "tokens", "chains", "status"],
         "tokens":  ["address", "symbol", "chain", "amount", "price", "value"],
     }
     _SECTION_LABELS = {
@@ -116,6 +133,21 @@ class EvmExporter:
     def _active_sections(self, config: EvmExportConfig) -> list[str]:
         return [k for k in ("summary", "tokens") if getattr(config, self._SECTION_FLAGS[k])]
 
+    @staticmethod
+    def _section_rows(data: dict, section: str) -> list[dict]:
+        """Строки секции; в конце Summary — итоговая строка по OK-кошелькам."""
+        rows = list(data[section])
+        if section == "summary":
+            t = data["total"]
+            rows.append({
+                "address":       "TOTAL",
+                "total_usd":     t["sum_usd"],
+                "tokens_usd":    t["tokens_usd"],
+                "protocols_usd": t["protocols_usd"],
+                "status":        f"{t['ok_count']}/{t['total_count']} ok",
+            })
+        return rows
+
     def _export_csv(self, data: dict, config: EvmExportConfig, path: str) -> None:
         active = self._active_sections(config)
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -126,7 +158,7 @@ class EvmExporter:
                 writer.writerow([f"=== {self._SECTION_LABELS[section]} ==="])
                 cols = self._SECTION_COLUMNS[section]
                 writer.writerow(cols)
-                for row in data[section]:
+                for row in self._section_rows(data, section):
                     writer.writerow([row.get(c, "") for c in cols])
 
     # --- JSON ---
@@ -151,7 +183,7 @@ class EvmExporter:
                 ws = wb.create_sheet(sheet_names[section])
                 cols = self._SECTION_COLUMNS[section]
                 ws.append(cols)
-                for row in data[section]:
+                for row in self._section_rows(data, section):
                     ws.append([row.get(c, "") for c in cols])
 
         wb.save(path)

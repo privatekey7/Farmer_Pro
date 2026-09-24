@@ -7,10 +7,20 @@ import threading
 import time
 from typing import Any
 
+from app.core.logger import SUCCESS
+
 logger = logging.getLogger(__name__)
 
 # Таймаут ожидания бриджа — 30 минут
 BRIDGE_TIMEOUT_SEC = 30 * 60
+
+# Перевод на биржу: попыток подготовки (баланс, газ) при сбое RPC и пауза между ними.
+EXCHANGE_PREP_ATTEMPTS = 3
+EXCHANGE_RETRY_SLEEP = 2.0
+
+# Бридж только если отправляемая сумма ≥ BRIDGE_MIN_VALUE_RATIO × ожидаемой
+# комиссии. Раньше с eth ушло $0.022 при газе $0.077.
+BRIDGE_MIN_VALUE_RATIO = 3
 
 # OP-stack GasPriceOracle — одинаковый адрес на всех OP-stack цепях
 # (OP, Base, INK, Unichain, Mode, Lisk, Soneium, World, Zora...)
@@ -67,6 +77,142 @@ def _get_l1_fee_safe(w3: Any, tx_req: dict) -> int:
         return fee * 11 // 10
     except Exception:
         return 0  # Non-OP-stack цепь или оракул недоступен
+
+
+def _bridge_gas_reserve(w3: Any, tx_req: dict, l1_fee: int) -> int | None:
+    costs = _bridge_gas_costs(w3, tx_req, l1_fee)
+    return costs[0] if costs else None
+
+
+def _pick_provider(balance_wei: int, options: dict[str, tuple[int, int]]) -> str:
+    """Провайдер с наибольшим ЧИСТЫМ результатом: out × (баланс − запас на газ) / баланс.
+
+    Пробные котировки считаются на весь баланс, а газа провайдеры закладывают
+    по-разному: на eth LI.FI — 536 900 gas, Relay — 32 713; на era — 4 033 000
+    против 272 344. Сравнение только по out выбирало LI.FI, и его запас съедал
+    почти весь баланс (с eth ушло $0.022 из $0.44, на era остался $1).
+    options: {provider: (out_probe, gas_reserve)}.
+    """
+    def net(item: tuple[str, tuple[int, int]]) -> tuple[int, int]:
+        out, reserve = item[1]
+        sendable = max(0, balance_wei - reserve)
+        return (out * sendable // balance_wei if balance_wei > 0 else 0, out)
+
+    return max(options.items(), key=net)[0]
+
+
+def _bridge_gas_costs(w3: Any, tx_req: dict, l1_fee: int) -> tuple[int, int] | None:
+    """(запас на газ, ожидаемая комиссия) бриджа.
+
+    Запас: gasLimit × цена, которую поставит sign_and_send, + L1, +5%.
+
+    Раньше: 2 × gasLimit × maxFeePerGas из котировки. На zkSync gasLimit и
+    потолок котировки завышены многократно: запас выходил $1.40 при реальной
+    стоимости ~$0.03, и $1.41 так и оставались на era. Цена здесь — та же,
+    что поставит sign_and_send (baseFee × 1.1 + priority; legacy — max(gasPrice,
+    2×baseFee)), а race между проверкой и отправкой закрывает _fit_max_fee.
+    Ожидаемая комиссия (для правила выгоды): gasLimit × (baseFee + priority) + L1 —
+    без потолка, это приблизительно то, что реально спишется.
+    None — посчитать нельзя (нет gasLimit/блока), вызывающий берёт старую оценку.
+    """
+    from app.modules.token_collector._signer import MIN_MAX_FEE_PCT, effective_priority
+
+    gas_limit = _hi(tx_req.get("gasLimit") or tx_req.get("gas"))
+    if not gas_limit:
+        return None
+    try:
+        base_fee = w3.eth.get_block("latest").get("baseFeePerGas") or 0
+    except Exception:
+        return None
+    if "maxFeePerGas" in tx_req:
+        if not base_fee:
+            return None
+        priority = effective_priority(w3, _hi(tx_req.get("maxPriorityFeePerGas")))
+        price = base_fee * MIN_MAX_FEE_PCT // 100 + priority
+        expected_price = base_fee + priority
+    else:
+        quote_gp = _hi(tx_req.get("gasPrice"))
+        price = max(quote_gp, base_fee * 2) if base_fee else quote_gp * 2
+        expected_price = price          # legacy: платится вся gasPrice
+    if not price:
+        return None
+    return (gas_limit * price + l1_fee) * 105 // 100, gas_limit * expected_price + l1_fee
+
+
+def _relay_step_txs(relay_q: dict) -> list[dict]:
+    """Все транзакции котировки Relay по порядку: подготовительные (approve…) и депозит.
+
+    Для сетей, где «нативный» токен — ERC-20 (Celo), Relay отдаёт два шага:
+    approve + deposit. Раньше брался только steps[0] — уходил один approve,
+    депозит не отправлялся, а приложение 30 минут ждало поступления.
+    Шаги-подписи (kind != transaction) не поддерживаются → исключение (бридж не делается).
+    """
+    txs: list[dict] = []
+    for step in relay_q.get("steps") or []:
+        kind = step.get("kind", "transaction")
+        if kind != "transaction":
+            raise RuntimeError(f"Relay step '{step.get('id')}' kind={kind} is not supported")
+        for item in step.get("items") or []:
+            txs.append(item["data"])
+    if not txs:
+        raise RuntimeError("Relay quote has no transactions")
+    return txs
+
+
+def _sum_gas_costs(w3: Any, txs: list[dict], l1_fees: list[int]) -> tuple[int, int] | None:
+    """(запас, ожидаемая комиссия) для последовательности транзакций; None — если хоть одну не оценить."""
+    reserve = expected = 0
+    for tx, l1 in zip(txs, l1_fees):
+        c = _bridge_gas_costs(w3, tx, l1)
+        if c is None:
+            return None
+        reserve += c[0]
+        expected += c[1]
+    return reserve, expected
+
+
+async def _send_tx_sequence(
+    loop: asyncio.AbstractEventLoop, w3: Any, txs: list[dict], private_key: str, address: str,
+    ops: list[dict] | None, chain_label: str,
+) -> tuple[str | None, str | None]:
+    """Отправляет шаги по порядку. Все, кроме последнего, — подготовительные (approve):
+    ждём подтверждения, иначе основную tx не шлём (без allowance она откатится).
+    Последняя — основная (весь баланс минус газ, потолок ×1.1).
+
+    Возвращает (хэш последней отправленной tx, статус ошибки | None при успехе).
+    """
+    from app.modules.token_collector._signer import SEND_ALL_MAX_FEE_PCT, TransactionReverted, sign_and_send
+
+    for i, tx in enumerate(txs):
+        last = i == len(txs) - 1
+        kwargs = {"max_fee_pct": SEND_ALL_MAX_FEE_PCT} if last else {}
+        try:
+            tx_hash, receipt = await loop.run_in_executor(
+                None, lambda tx=tx, kwargs=kwargs: sign_and_send(w3, tx, private_key, address, **kwargs)
+            )
+        except TransactionReverted as e:
+            if not last and ops is not None:
+                ops.append({"type": "approve", "chain": chain_label, "detail": "relay step",
+                            "usd": 0.0, "tx": e.tx_hash, "status": "REVERTED"})
+            logger.warning("[Wallet %s] Tx reverted (step %d/%d): %s", address[:10], i + 1, len(txs), e.tx_hash)
+            return e.tx_hash, "TX_REVERTED"
+        except Exception as e:
+            if "-32000" in str(e):
+                logger.warning("[Wallet %s] Tx rejected by node (step %d/%d): %s",
+                               address[:10], i + 1, len(txs), str(e)[:160])
+                return None, "NODE_REJECTED"
+            raise
+        if last:
+            return tx_hash, None
+        if ops is not None:
+            ops.append({"type": "approve", "chain": chain_label, "detail": "relay step",
+                        "usd": 0.0, "tx": tx_hash, "status": "CONFIRMED" if receipt is not None else "PENDING"})
+        if receipt is None:
+            logger.warning("[Wallet %s] Step %d/%d not confirmed — next step not sent: %s",
+                           address[:10], i + 1, len(txs), tx_hash)
+            return tx_hash, "TIMEOUT"
+        logger.log(SUCCESS, "[Wallet %s] Step %d/%d confirmed (approve): %s", address[:10], i + 1, len(txs), tx_hash)
+    return None, "NO_QUOTE"
 
 
 def _relay_quote_is_too_small_error(exc: Exception) -> bool:
@@ -173,23 +319,27 @@ async def bridge_native(
     relay_chain_ids: set[int],
     native_token_by_id: dict[int, dict],
     relay_native_by_id: dict[int, dict],
-    target_chain_ids: list[int],
+    tgt_chain_id: int,
     src_chain_id: int,
     gas_prices: dict,
     stop_event: threading.Event,
+    ops: list[dict] | None = None,
 ) -> tuple[str | None, str, int | None, float]:
     """
-    ШАГ 3: бридж нативного токена из src_chain_id в target_chain.
+    ШАГ 3: бридж нативного токена из src_chain_id в tgt_chain_id.
     Возвращает (bridge_tx, bridge_status, tgt_chain_id, sent_usd).
     sent_usd — USD-стоимость отправленной суммы при статусе COMPLETED, иначе 0.0.
+
+    tgt_chain_id выбирается ОДИН раз на кошелёк (вызывающим): раньше здесь
+    был random.choice на каждую исходную сеть — средства расходились по разным
+    целевым сетям, а на биржу уходили только из одной.
     """
     from app.integrations.lifi_client import LiFiNoRouteError
     from app.integrations.relay_client import RelayNoRouteError
-    from app.modules.token_collector._signer import sign_and_send, TransactionReverted
+    from app.modules.token_collector._signer import SEND_ALL_MAX_FEE_PCT, sign_and_send, TransactionReverted
 
     loop = asyncio.get_running_loop()
 
-    tgt_chain_id = random.choice(target_chain_ids)
     logger.info("[Wallet %s] Bridge: chain %s → %s", address[:10], src_chain_id, tgt_chain_id)
 
     # Определяем доступных провайдеров
@@ -270,9 +420,13 @@ async def bridge_native(
     lifi_out = 0
     lifi_gas = 0
     lifi_l1_fee = 0
+    lifi_tx_req_probe: dict = {}
     relay_out = 0
     relay_gas = 0
     relay_l1_fee = 0
+    relay_tx_req: dict = {}
+    relay_txs: list[dict] = []
+    relay_l1_fees: list[int] = []
 
     if lifi_ok:
         try:
@@ -317,13 +471,15 @@ async def bridge_native(
             # Берём газ из tx_req source-транзакции (gasLimit × gasPrice).
             # fees["relayer"] — протокольная комиссия, вычитается из VALUE (output),
             # не требует дополнительного ETH в кошельке — не включаем в gas_reserve.
-            relay_tx_req = relay_q["steps"][0]["items"][0]["data"]
-            relay_gas = _tx_gas_cost(relay_tx_req)
+            relay_txs = _relay_step_txs(relay_q)
+            relay_tx_req = relay_txs[-1]                      # депозит
+            relay_gas = sum(_tx_gas_cost(t) for t in relay_txs)
             if relay_gas == 0:
                 relay_gas = int(relay_q["fees"]["gas"]["amount"])
             relay_out = int(relay_q["details"]["currencyOut"]["amount"])
-            # L1 data fee для OP-stack (на ETH/ARB/etc. возвращает 0)
-            relay_l1_fee = await loop.run_in_executor(None, _get_l1_fee_safe, w3, relay_tx_req)
+            # L1 data fee для OP-stack (на ETH/ARB/etc. возвращает 0) — по каждому шагу
+            relay_l1_fees = [await loop.run_in_executor(None, _get_l1_fee_safe, w3, t) for t in relay_txs]
+            relay_l1_fee = sum(relay_l1_fees)
         except Exception as e:
             logger.warning("[Wallet %s] Relay quote failed: %s", address[:10], e)
             relay_ok = False
@@ -331,31 +487,30 @@ async def bridge_native(
     if not lifi_ok and not relay_ok:
         return None, "NO_QUOTE", None, 0.0
 
-    # Выбор провайдера по максимальному out
-    if lifi_ok and relay_ok:
-        provider = "lifi" if lifi_out >= relay_out else "relay"
-    elif lifi_ok:
-        provider = "lifi"
-    else:
-        provider = "relay"
+    # Запас на газ и ожидаемая комиссия — у каждого провайдера свои
+    # (нет данных для точной оценки — прежняя консервативная: газ котировки × 2 + L1).
+    costs: dict[str, tuple[int, int | None]] = {}
+    if lifi_ok:
+        c = await loop.run_in_executor(None, _bridge_gas_costs, w3, lifi_tx_req_probe, lifi_l1_fee)
+        costs["lifi"] = c if c else (lifi_gas * 2 + lifi_l1_fee, None)
+    if relay_ok:
+        c = await loop.run_in_executor(None, _sum_gas_costs, w3, relay_txs, relay_l1_fees)
+        costs["relay"] = c if c else (relay_gas * 2 + relay_l1_fee, None)
+    outs = {"lifi": lifi_out, "relay": relay_out}
+
+    # Выбор провайдера по чистому результату (после запаса на газ), а не по out на весь баланс
+    provider = _pick_provider(balance_wei, {p: (outs[p], costs[p][0]) for p in costs})
 
     chosen_gas = lifi_gas if provider == "lifi" else relay_gas
     chosen_l1_fee = lifi_l1_fee if provider == "lifi" else relay_l1_fee
-    chosen_out = lifi_out if provider == "lifi" else relay_out
-    if chosen_l1_fee:
-        logger.info(
-            "[Bridge] provider=%s out=%.6f (lifi=%s relay=%s) l1_fee=%d",
-            provider, chosen_out / 1e18, lifi_out, relay_out, chosen_l1_fee,
-        )
-    else:
-        logger.info(
-            "[Bridge] provider=%s out=%.6f (lifi=%s relay=%s)",
-            provider, chosen_out / 1e18, lifi_out, relay_out,
-        )
-
-    # gas_reserve = source tx gas × 2 (запас на случай спайка baseFee)
-    # + L1 data fee для OP-stack цепей (на ETH/ARB/etc. = 0).
-    gas_reserve = chosen_gas * 2 + chosen_l1_fee
+    chosen_out = outs[provider]
+    gas_reserve, expected_fee = costs[provider]
+    logger.info(
+        "[Bridge] provider=%s out=%.6f | lifi out=%s reserve=%s | relay out=%s reserve=%s%s",
+        provider, chosen_out / 1e18,
+        lifi_out, costs.get("lifi", (None,))[0], relay_out, costs.get("relay", (None,))[0],
+        f" | l1_fee={chosen_l1_fee}" if chosen_l1_fee else "",
+    )
 
     if gas_reserve == 0:
         # Последний fallback: web3 gas_price × лимит для bridge tx
@@ -377,6 +532,15 @@ async def bridge_native(
         logger.info("[Wallet %s] Insufficient balance for bridge after gas reserve", address[:10])
         return None, "INSUFFICIENT", tgt_chain_id, 0.0
 
+    # Правило выгоды: не отправлять сумму, сопоставимую с комиссией
+    if expected_fee and send_amount < BRIDGE_MIN_VALUE_RATIO * expected_fee:
+        logger.info(
+            "[Wallet %s] Bridge skipped: send $%.4f < %d × expected gas $%.4f — not worth it",
+            address[:10], send_amount / 1e18 * price_usd, BRIDGE_MIN_VALUE_RATIO,
+            expected_fee / 1e18 * price_usd,
+        )
+        return None, "NOT_WORTH", tgt_chain_id, 0.0
+
     # Финальная котировка
     try:
         if provider == "lifi":
@@ -387,7 +551,7 @@ async def bridge_native(
                 src_native, tgt_native,
                 send_amount, address, address, settings.slippage,
             )
-            tx_req = final_quote["transactionRequest"]
+            final_txs = [final_quote["transactionRequest"]]
         else:
             relay_src_native = (
                 relay_native_by_id.get(src_chain_id, {}).get("address")
@@ -404,7 +568,7 @@ async def bridge_native(
                 relay_src_native, relay_tgt_native,
                 str(send_amount), address,
             )
-            tx_req = final_quote["steps"][0]["items"][0]["data"]
+            final_txs = _relay_step_txs(final_quote)
     except Exception as e:
         logger.warning(
             "[Wallet %s] Final quote failed (provider=%s, send_amount=%d): %s",
@@ -416,7 +580,6 @@ async def bridge_native(
     # читаем свежий baseFee и применяем priority из котировки.
     # ВАЖНО: tx_req.maxFeePerGas у Relay может быть placeholder (0 или 1 wei) —
     # нельзя использовать как fallback; нужен реальный baseFee из сети.
-    gas_limit = _hi(tx_req.get("gasLimit") or tx_req.get("gas"))
     base_fee: int | None = None
     try:
         base_fee = await loop.run_in_executor(None, lambda: w3.eth.get_block("latest")["baseFeePerGas"])
@@ -428,20 +591,28 @@ async def bridge_native(
             logger.warning("[Wallet %s] Cannot determine gas price for safety check (%s) — skipping bridge", address[:10], _e2)
             return None, "INSUFFICIENT", tgt_chain_id, 0.0
 
-    if "maxFeePerGas" in tx_req:
-        priority = max(1, _hi(tx_req.get("maxPriorityFeePerGas")))
-        effective_gas_price = base_fee * 11 // 10 + priority
-    else:
-        quote_gp = _hi(tx_req.get("gasPrice"))
-        effective_gas_price = max(quote_gp, base_fee * 2) if base_fee else quote_gp * 2
-
-    final_gas_cost = gas_limit * effective_gas_price
-    # L1 data fee для финальной котировки (OP-stack цепи)
-    l1_data_fee = await loop.run_in_executor(None, _get_l1_fee_safe, w3, tx_req)
-    tx_value = _hi(tx_req.get("value"))
+    # Все шаги (approve + deposit у Relay на Celo): газ, L1 и value — суммой
+    from app.modules.token_collector._signer import effective_priority
+    final_gas_cost = l1_data_fee = tx_value = gas_limit = 0
+    effective_gas_price = 0
+    for tx_req in final_txs:
+        step_gas = _hi(tx_req.get("gasLimit") or tx_req.get("gas"))
+        if "maxFeePerGas" in tx_req:
+            priority = await loop.run_in_executor(
+                None, effective_priority, w3, _hi(tx_req.get("maxPriorityFeePerGas"))
+            )
+            effective_gas_price = base_fee * 11 // 10 + priority
+        else:
+            quote_gp = _hi(tx_req.get("gasPrice"))
+            effective_gas_price = max(quote_gp, base_fee * 2) if base_fee else quote_gp * 2
+        gas_limit += step_gas
+        final_gas_cost += step_gas * effective_gas_price
+        l1_data_fee += await loop.run_in_executor(None, _get_l1_fee_safe, w3, tx_req)
+        tx_value += _hi(tx_req.get("value"))
     logger.info(
-        "[Wallet %s] Safety check: value=%d gas_limit=%d gas_price=%d gas_cost=%d l1_fee=%d balance=%d",
-        address[:10], tx_value, gas_limit, effective_gas_price, final_gas_cost, l1_data_fee, balance_wei,
+        "[Wallet %s] Safety check: steps=%d value=%d gas_limit=%d gas_price=%d gas_cost=%d l1_fee=%d balance=%d",
+        address[:10], len(final_txs), tx_value, gas_limit, effective_gas_price, final_gas_cost, l1_data_fee,
+        balance_wei,
     )
     if tx_value + final_gas_cost + l1_data_fee > balance_wei:
         logger.warning(
@@ -458,25 +629,19 @@ async def bridge_native(
     except Exception as e:
         logger.warning("[Wallet %s] Could not get pre-bridge balance on chain %s: %s", address[:10], tgt_chain_id, e)
 
-    try:
-        tx_hash, receipt = await loop.run_in_executor(
-            None, sign_and_send, w3, tx_req, private_key, address
-        )
-    except TransactionReverted as e:
-        logger.warning("[Wallet %s] Bridge tx reverted: %s", address[:10], e.tx_hash)
-        return e.tx_hash, "TX_REVERTED", tgt_chain_id, 0.0
-    except Exception as e:
-        e_str = str(e)
-        if "-32000" in e_str:
-            logger.warning("[Wallet %s] Bridge tx rejected by node: %s", address[:10], e_str[:160])
-            return None, "NODE_REJECTED", tgt_chain_id, 0.0
-        raise
+    tx_hash, fail_status = await _send_tx_sequence(
+        loop, w3, final_txs, private_key, address, ops, chain_label=str(src_chain_id),
+    )
+    if fail_status:
+        return tx_hash, fail_status, tgt_chain_id, 0.0
 
-    # Ожидаемый минимум поступления (50% от quoted toAmountMin — консервативный порог)
+    # Ожидаемый минимум поступления (50% от quoted toAmountMin — консервативный порог).
+    # Обе ветки — по ФИНАЛЬНОЙ котировке (по ней ушла tx); у Relay раньше бралась
+    # пробная котировка на весь баланс, а не на send_amount.
     if provider == "lifi":
         to_amount_min = int(final_quote.get("estimate", {}).get("toAmountMin", 0))
     else:
-        to_amount_min = int(relay_q.get("details", {}).get("currencyOut", {}).get("minimumAmount", 0) or 0)
+        to_amount_min = int(final_quote.get("details", {}).get("currencyOut", {}).get("minimumAmount", 0) or 0)
     expected_min = int(to_amount_min * 0.5) if to_amount_min > 0 else 1
 
     logger.info(
@@ -540,7 +705,8 @@ async def _poll_balance_increase(
             balance = await loop.run_in_executor(None, w3.eth.get_balance, address)
             increase = balance - pre_balance
             if increase >= expected_min:
-                logger.info(
+                logger.log(
+                    SUCCESS,
                     "[Wallet %s] Bridge COMPLETED: balance on chain %s +%.6f ETH (after %ds)",
                     address[:10], tgt_chain_id, increase / 1e18, elapsed,
                 )
@@ -575,13 +741,18 @@ async def refuel_chain(
     relay_native_by_id: dict[int, dict],
     rpc_resolver: Any,
     stop_event: threading.Event,
+    ops: list[dict] | None = None,
+    donor_price_usd: float = 0.0,
+    route_label: str = "",
 ) -> bool:
     """
     ШАГ 2.5: отправляет небольшое количество нативного токена из donor_chain_id
     в tgt_chain_id через Relay, чтобы покрыть газ для последующих свапов.
     Возвращает True если средства успешно доставлены.
+    ops (если передан) пополняется записью об отправленном refuel: сумма в USD
+    по donor_price_usd, хэш и статус (SENT → ARRIVED / TIMEOUT).
     """
-    from app.modules.token_collector._signer import sign_and_send
+    from app.modules.token_collector._signer import SEND_ALL_MAX_FEE_PCT, TransactionReverted, sign_and_send
 
     REFUEL_TIMEOUT_SEC = 3 * 60  # 3 минуты
     POLL_INTERVAL = 10
@@ -617,7 +788,11 @@ async def refuel_chain(
     if not relay_q or actual_refuel_amount is None:
         return False
 
-    tx_req = relay_q["steps"][0]["items"][0]["data"]
+    try:
+        refuel_txs = _relay_step_txs(relay_q)
+    except Exception as e:
+        logger.warning("[Refuel] Unsupported Relay quote %s → %s: %s", donor_chain_id, tgt_chain_id, e)
+        return False
     if actual_refuel_amount != refuel_amount_wei:
         logger.info(
             "[Refuel] Adjusted input %s → %s: %d -> %d wei (quoted out %d wei)",
@@ -643,13 +818,26 @@ async def refuel_chain(
     except Exception as e:
         logger.warning("[Refuel] Could not get pre-balance on chain %s: %s", tgt_chain_id, e)
 
+    label = route_label or f"{donor_chain_id} → {tgt_chain_id}"
     try:
-        tx_hash, _ = await loop.run_in_executor(
-            None, sign_and_send, w3_donor, tx_req, private_key, address
+        tx_hash, fail_status = await _send_tx_sequence(
+            loop, w3_donor, refuel_txs, private_key, address, ops, chain_label=label,
         )
     except Exception as e:
         logger.warning("[Refuel] Failed to send refuel tx: %s", e)
         return False
+    if fail_status:
+        # refuel, откатившийся on-chain, тоже попадает в список операций
+        if ops is not None and tx_hash and fail_status == "TX_REVERTED" and len(refuel_txs) == 1:
+            ops.append({"type": "refuel", "chain": label, "detail": "gas", "usd": 0.0,
+                        "tx": tx_hash, "status": "REVERTED"})
+        logger.warning("[Refuel] Refuel not sent/failed (%s): %s", fail_status, tx_hash)
+        return False
+
+    op = {"type": "refuel", "chain": route_label or f"{donor_chain_id} → {tgt_chain_id}", "detail": "gas",
+          "usd": round(actual_refuel_amount / 1e18 * donor_price_usd, 4), "tx": tx_hash, "status": "SENT"}
+    if ops is not None:
+        ops.append(op)
 
     logger.info("[Refuel] Tx sent: %s — waiting for arrival on chain %s...", tx_hash, tgt_chain_id)
 
@@ -665,7 +853,9 @@ async def refuel_chain(
         try:
             balance = await loop.run_in_executor(None, w3_tgt.eth.get_balance, address)
             if balance - pre_balance >= expected_min:
-                logger.info(
+                op["status"] = "ARRIVED"
+                logger.log(
+                    SUCCESS,
                     "[Refuel] Arrived on chain %s: +%.8f ETH (after %ds)",
                     tgt_chain_id, (balance - pre_balance) / 1e18, elapsed,
                 )
@@ -677,8 +867,22 @@ async def refuel_chain(
             except RuntimeError:
                 return False
 
+    op["status"] = "TIMEOUT"
     logger.warning("[Refuel] Timeout waiting for arrival on chain %s", tgt_chain_id)
     return False
+
+
+def exchange_pct(settings: Any) -> int:
+    """Процент доступного баланса для перевода на биржу — целый, 1–100.
+
+    exchange_pct_min == exchange_pct_max → фиксированный процент; иначе —
+    случайный целый в диапазоне (для каждого кошелька свой). Значения вне 1–100
+    обрезаются, перепутанные «от»/«до» меняются местами. Нет настроек → 100%.
+    """
+    lo = int(getattr(settings, "exchange_pct_min", 100) or 100)
+    hi = int(getattr(settings, "exchange_pct_max", 100) or 100)
+    lo, hi = sorted((min(100, max(1, lo)), min(100, max(1, hi))))
+    return random.randint(lo, hi)
 
 
 async def send_to_exchange(
@@ -690,10 +894,13 @@ async def send_to_exchange(
     gas_prices: dict,
     settings: Any,
     stop_event: threading.Event,
+    ops: list[dict] | None = None,
+    price_usd: float = 0.0,
 ) -> str | None:
     """
     ШАГ 4: посекундный delay, затем ETH transfer на субаккаунт биржи.
-    Возвращает tx_hash или None при ошибке/пропуске.
+    Возвращает tx_hash (в т.ч. если tx ушла, но не подтвердилась) или None при
+    ошибке/пропуске. ops (если передан) пополняется записью о переводе.
     """
     loop = asyncio.get_running_loop()
 
@@ -708,53 +915,129 @@ async def send_to_exchange(
         await asyncio.sleep(1)
 
     try:
+        from web3 import Web3
+        from app.modules.token_collector._signer import SWAP_MAX_FEE_PCT, sign_and_send
+
+        # Адрес из файла субаккаунтов может быть в нижнем регистре: подпись его
+        # нормализовала, а estimate_gas — нет, и перевод падал
+        # («web3.py only accepts checksum addresses»).
+        exchange_address = Web3.to_checksum_address(exchange_address)
         w3 = rpc_resolver.get_web3(tgt_chain_id)
-        balance_wei = await loop.run_in_executor(None, w3.eth.get_balance, address)
-
-        # Расчёт газа
-        chain_gas = gas_prices.get(str(tgt_chain_id), gas_prices.get(tgt_chain_id, {}))
-        gas_price_wei = chain_gas.get("fast") or chain_gas.get("standard") or 0
-        if not gas_price_wei:
-            gas_price_wei = await loop.run_in_executor(None, lambda: w3.eth.gas_price)
-
-        tx_stub = {"from": address, "to": exchange_address, "value": balance_wei}
-        estimated_gas = await loop.run_in_executor(None, w3.eth.estimate_gas, tx_stub)
-        gas_cost_wei = estimated_gas * gas_price_wei
-        send_amount = balance_wei - (gas_cost_wei * 2)
-
-        if send_amount <= 0:
-            logger.info("[Wallet %s] Balance too low for exchange transfer", address[:10])
+        # Подготовка — с повтором через другой RPC: соединение, простоявшее минуты
+        # (пауза после бриджа), нода может закрыть — «Connection aborted / 10054».
+        # Отправку не повторяем здесь: её обрывы обрабатывает sign_and_send.
+        for attempt in range(EXCHANGE_PREP_ATTEMPTS):
+            try:
+                prepared = await _prepare_exchange(loop, w3, address, exchange_address, tgt_chain_id, gas_prices, settings)
+                break
+            except Exception as e:
+                if attempt == EXCHANGE_PREP_ATTEMPTS - 1:
+                    raise
+                logger.warning("[Wallet %s] RPC error preparing exchange transfer (%s) — retrying via another RPC",
+                               address[:10], str(e)[:100])
+                await asyncio.sleep(EXCHANGE_RETRY_SLEEP)
+                try:
+                    w3 = rpc_resolver.rotate(tgt_chain_id)
+                except Exception:
+                    pass
+        if prepared is None:
             return None
+        tx_req, send_amount, pct = prepared
 
-        # Строим Legacy-транзакцию для простого ETH transfer
-        nonce = await loop.run_in_executor(
-            None, lambda: w3.eth.get_transaction_count(address, "pending")
-        )
-        chain_id = await loop.run_in_executor(None, lambda: w3.eth.chain_id)
-        tx_req = {
-            "to": exchange_address,
-            "data": "0x",
-            "value": hex(send_amount),
-            "gasLimit": hex(estimated_gas),
-            "gasPrice": hex(gas_price_wei),
-            "chainId": chain_id,
-        }
-
-        from app.modules.token_collector._signer import sign_and_send
         tx_hash, receipt = await loop.run_in_executor(
-            None, sign_and_send, w3, tx_req, private_key, address
+            None, lambda: sign_and_send(w3, tx_req, private_key, address, keep_fees=True)
         )
+
+        op = {"type": "exchange", "chain": str(tgt_chain_id), "detail": f"{exchange_address} ({pct}%)",
+              "usd": round(send_amount / 1e18 * price_usd, 4), "tx": tx_hash,
+              "status": "CONFIRMED" if receipt is not None else "PENDING"}
+        if ops is not None:
+            ops.append(op)
 
         if receipt is None:
-            return None
+            logger.warning("[Wallet %s] Exchange transfer not confirmed yet: %s", address[:10], tx_hash)
+            return tx_hash
 
         native_symbol = "ETH"
-        logger.info(
-            "[Wallet %s] Exchange transfer: %.6f %s → %s | tx: %s",
-            address[:10], send_amount / 1e18, native_symbol, exchange_address, tx_hash
+        logger.log(
+            SUCCESS,
+            "[Wallet %s] Exchange transfer: %.6f %s (%d%% of available) → %s | tx: %s",
+            address[:10], send_amount / 1e18, native_symbol, pct, exchange_address, tx_hash
         )
         return tx_hash
 
     except Exception as e:
         logger.error("[Wallet %s] Exchange transfer error: %s", address[:10], e)
+        if ops is not None:
+            ops.append({"type": "exchange", "chain": str(tgt_chain_id), "detail": f"{exchange_address}: {str(e)[:120]}",
+                        "usd": 0.0, "tx": "", "status": "FAILED"})
         return None
+
+
+async def _prepare_exchange(
+    loop: asyncio.AbstractEventLoop, w3: Any, address: str, exchange_address: str,
+    tgt_chain_id: int, gas_prices: dict, settings: Any,
+) -> tuple[dict, int, int] | None:
+    """Готовит перевод на биржу: (tx_req, сумма, процент) или None — отправлять нечего."""
+    from app.modules.token_collector._signer import SWAP_MAX_FEE_PCT
+
+    balance_wei = await loop.run_in_executor(None, w3.eth.get_balance, address)
+
+    tx_stub = {"from": address, "to": exchange_address, "value": balance_wei}
+    estimated_gas = await loop.run_in_executor(None, w3.eth.estimate_gas, tx_stub)
+    chain_id = await loop.run_in_executor(None, lambda: w3.eth.chain_id)
+    # L1 data fee (OP-stack): списывается сверх gas × price — резервируем явно.
+    l1_fee = await loop.run_in_executor(None, _get_l1_fee_safe, w3, {"data": "0x"})
+
+    # Комиссии считаются ОДИН раз и уходят в tx как есть (keep_fees=True).
+    # Раньше резерв считался по «fast»-цене LI.FI, а sign_and_send потом
+    # поднимал gasPrice до 2×baseFee — value + gas превышали баланс, нода
+    # отвечала «insufficient funds», и перевод молча не выполнялся.
+    base_fee = None
+    try:
+        block = await loop.run_in_executor(None, lambda: w3.eth.get_block("latest"))
+        base_fee = block.get("baseFeePerGas")
+    except Exception as e:
+        logger.debug("[Wallet %s] get_block failed for exchange transfer: %s", address[:10], e)
+
+    if base_fee is not None:
+        # EIP-1559: потолок 2×baseFee, платится фактический baseFee.
+        try:
+            priority = int(await loop.run_in_executor(None, lambda: w3.eth.max_priority_fee))
+        except Exception:
+            priority = 1
+        priority = max(1, priority)
+        max_fee = base_fee * SWAP_MAX_FEE_PCT // 100 + priority
+        fee_fields = {"maxFeePerGas": hex(max_fee), "maxPriorityFeePerGas": hex(priority)}
+        gas_cost_wei = estimated_gas * max_fee
+    else:
+        # Legacy-сеть: цена LI.FI «fast» (или сети) +20% запаса.
+        chain_gas = gas_prices.get(str(tgt_chain_id), gas_prices.get(tgt_chain_id, {}))
+        gas_price_wei = chain_gas.get("fast") or chain_gas.get("standard") or 0
+        if not gas_price_wei:
+            gas_price_wei = await loop.run_in_executor(None, lambda: w3.eth.gas_price)
+        gas_price_wei = int(gas_price_wei) * 12 // 10
+        fee_fields = {"gasPrice": hex(gas_price_wei)}
+        gas_cost_wei = estimated_gas * gas_price_wei
+
+    available = balance_wei - gas_cost_wei - l1_fee
+    if available <= 0:
+        logger.info("[Wallet %s] Balance too low for exchange transfer", address[:10])
+        return None
+
+    # Процент от доступного (баланс минус газ перевода): 100% — всё, как раньше
+    pct = exchange_pct(settings)
+    send_amount = available * pct // 100
+    if send_amount <= 0:
+        logger.info("[Wallet %s] Exchange amount is 0 at %d%%", address[:10], pct)
+        return None
+
+    tx_req = {
+        "to": exchange_address,
+        "data": "0x",
+        "value": hex(send_amount),
+        "gasLimit": hex(estimated_gas),
+        "chainId": chain_id,
+        **fee_fields,
+    }
+    return tx_req, send_amount, pct

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime data
+.cache/
+logs/
+
+# Dev-only (not shipped to users)
+tests/
+.pytest_cache/
+requirements-dev.txt
+CHANGELOG_DEV.md
+_gitbook_update/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

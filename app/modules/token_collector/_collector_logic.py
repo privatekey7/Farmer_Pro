@@ -11,66 +11,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# ── Anti-phantom corroboration (см. evm_balance_checker) ───────────────────
-# Исторически DeBank под высокой параллельной нагрузкой ~1/30 отдал портфель
-# ЧУЖОГО адреса; ответ внутренне согласован (реальные токены), поэтому одиночная
-# выборка фантом не ловит. Источник заменён на Rabby (готовый агрегат
-# total_balance), но корроборация оставлена как страховка: истинный набор
-# токенов СТАБИЛЕН между запросами, фантом — СЛУЧАЕН и не повторяется.
-# Принимаем список только когда >=2 независимые выборки сходятся по суммарному
-# total_usd; иначе — консервативно (наименьший total_usd), чтобы не раздувать
-# своп фантомными токенами. ~2-3 запр./кошелёк.
-COLLECTOR_CORROBORATION_MIN_AGREE = 2     # сколько согласных выборок нужно
-COLLECTOR_CORROBORATION_TOL_PCT = 0.02    # относительный допуск (2%)
-COLLECTOR_CORROBORATION_TOL_ABS = 1.0     # абсолютный допуск ($1) — для мелких балансов
-COLLECTOR_CORROBORATION_MAX_FETCHES = 5   # бюджет УСПЕШНЫХ выборок на кошелёк
-
-
-def _tokens_total_usd(tokens: Any) -> float:
-    """Суммарная USD-стоимость списка токенов Rabby (price * amount)."""
-    if not isinstance(tokens, list):
-        return 0.0
-    total = 0.0
-    for t in tokens:
-        try:
-            total += (t.get("price", 0) or 0) * (t.get("amount", 0) or 0)
-        except (TypeError, ValueError, AttributeError):
-            continue
-    return total
-
-
-def _values_agree(a: float, b: float) -> bool:
-    """Согласованы ли два total_usd в пределах абсолютного ИЛИ относительного допуска."""
-    diff = abs(a - b)
-    if diff <= COLLECTOR_CORROBORATION_TOL_ABS:
-        return True
-    return diff <= COLLECTOR_CORROBORATION_TOL_PCT * max(abs(a), abs(b), 1.0)
-
-
-def _agreeing_cluster(snapshots: list[dict]) -> list[dict] | None:
-    """Наибольший кластер согласных по total_usd выборок (размером >= MIN_AGREE).
-
-    Возвращает None, пока ни один кластер не набрал нужного числа подтверждений.
-    """
-    best: list[dict] | None = None
-    for anchor in snapshots:
-        cluster = [s for s in snapshots if _values_agree(s["total_usd"], anchor["total_usd"])]
-        if len(cluster) >= COLLECTOR_CORROBORATION_MIN_AGREE and (best is None or len(cluster) > len(best)):
-            best = cluster
-    return best
-
-
-def _representative(cluster: list[dict]) -> dict:
-    """Из согласного кластера берём выборку с медианным total_usd (стабильный выбор)."""
-    ordered = sorted(cluster, key=lambda s: s["total_usd"])
-    return ordered[len(ordered) // 2]
-
-
-def _conservative_pick(snapshots: list[dict]) -> dict:
-    """Бюджет исчерпан без согласия → наименьший total_usd (исключает раздувание фантомом)."""
-    return min(snapshots, key=lambda s: s["total_usd"])
-
-
 def _get_native_addr(
     chain_id: int,
     native_token_by_id: dict[int, dict],
@@ -170,6 +110,44 @@ def _hi(v) -> int:
     return int(v)
 
 
+async def _swap_simulation_ok(
+    loop: asyncio.AbstractEventLoop, w3: Any, tx_req: dict, address: str,
+    chain_id: int, contract: str, symbol: str, log_prefix: str,
+) -> bool:
+    """Симуляция свопа перед отправкой. Откат → токен в чёрный список, своп не шлём.
+
+    Котировка может выглядеть нормально (USA: $0.40 → $0.37), а своп всё равно
+    откатывается — такой токен нельзя продать. Симуляция бесплатна; раньше
+    ради него делался refuel ($0.26) и сжигался газ на откатившемся свопе.
+    Сбой самой симуляции (не откат) своп не блокирует.
+    """
+    from app.modules.token_collector._bad_tokens import mark_bad
+    from app.modules.token_collector._signer import simulate_tx
+
+    ok = await loop.run_in_executor(None, simulate_tx, w3, tx_req, address)
+    if ok is False:
+        mark_bad(chain_id, contract, symbol, "swap simulation reverted")
+        logger.warning(
+            "%s Skip %s: swap simulation reverts — token can't be sold (honeypot / sell tax?), "
+            "added to blocklist", log_prefix, symbol,
+        )
+        return False
+    return True
+
+
+async def _has_allowance(loop: asyncio.AbstractEventLoop, w3: Any, contract: str,
+                         address: str, spender: str, amount: int) -> bool:
+    """Уже выдан ли approve на amount (тогда своп можно симулировать до approve/refuel)."""
+    from app.modules.token_collector._signer import get_allowance
+
+    if not spender:
+        return True
+    try:
+        return await loop.run_in_executor(None, get_allowance, w3, contract, address, spender) >= amount
+    except Exception:
+        return False
+
+
 async def _estimate_swap_tx_cost(
     loop: asyncio.AbstractEventLoop,
     w3: Any,
@@ -178,19 +156,26 @@ async def _estimate_swap_tx_cost(
     """
     Возвращает (gas_limit, effective_gas_price, tx_value, l1_data_fee) для swap tx.
     Логика зеркалирует sign_and_send и добавляет L1 data fee для OP-stack цепей.
+    effective_gas_price — МИНИМАЛЬНЫЙ рабочий потолок (baseFee × 1.1 + priority):
+    по нему решается, хватает ли газа. Потолок ×2 sign_and_send ставит только
+    если баланс позволяет (_fit_max_fee). Раньше проверка шла по ×2, и кошельки,
+    которым газа хватало, уходили в refuel (на arb — лишний перевод $0.73).
     """
     from app.modules.token_collector._bridge_logic import _get_l1_fee_safe
+    from app.modules.token_collector._signer import MIN_MAX_FEE_PCT, effective_priority
 
     gas_limit = _hi(tx_req.get("gasLimit") or tx_req.get("gas"))
     tx_value = _hi(tx_req.get("value"))
 
     if "maxFeePerGas" in tx_req:
-        priority = max(1, _hi(tx_req.get("maxPriorityFeePerGas")))
+        priority = await loop.run_in_executor(
+            None, effective_priority, w3, _hi(tx_req.get("maxPriorityFeePerGas"))
+        )
         try:
             base_fee = await loop.run_in_executor(
                 None, lambda: w3.eth.get_block("latest")["baseFeePerGas"]
             )
-            effective_gas_price = base_fee * 11 // 10 + priority
+            effective_gas_price = base_fee * MIN_MAX_FEE_PCT // 100 + priority
         except Exception:
             quote_max_fee = _hi(tx_req.get("maxFeePerGas"))
             effective_gas_price = max(quote_max_fee * 2, priority)
@@ -211,7 +196,7 @@ async def _estimate_swap_tx_cost(
 async def fetch_and_swap(
     wallet: dict,                               # {"raw": "0x...", "type": "private_key"}
     lifi_client: Any,                           # LiFiClient
-    balance_client: Any,                        # RabbyClient
+    proxy_rotator: Any,                         # ProxyRotator
     rpc_resolver: Any,                          # RpcResolver
     settings: Any,                              # CollectorSettings
     native_token_by_id: dict[int, dict],
@@ -226,55 +211,39 @@ async def fetch_and_swap(
     своп не-нативных токенов в нативный через LI.FI.
     Возвращает статистику: chains_processed, chains_skipped, tokens_swapped, total_usd.
     """
+    from app.integrations.balance_verifier import check_wallet
     from app.integrations.lifi_client import DEBANK_TO_CHAIN_ID, LiFiNoRouteError
-    from app.modules.token_collector._signer import derive_address, sign_and_send, ensure_erc20_approval, InsufficientFundsError
+    from app.modules.token_collector._signer import (
+        derive_address, sign_and_send, ensure_erc20_approval, InsufficientFundsError, TransactionReverted,
+    )
+    from app.modules.token_collector._bad_tokens import is_bad
+    from app.core.logger import SUCCESS
 
     address, private_key = derive_address(wallet["raw"], wallet["type"])
     loop = asyncio.get_running_loop()
 
-    # ШАГ 1: Получить балансы с корроборацией против фантомов (см. блок
-    # констант выше). Принимаем список токенов только когда >=2 независимые
-    # выборки сошлись по суммарному total_usd (случайный фантом почти
-    # никогда не повторяется).
-    BALANCE_RETRY = 10
-    snapshots: list[dict] = []          # [{"total_usd": float, "tokens": list}]
-    last_exc: Exception | None = None
-    attempts = 0
-    max_attempts = COLLECTOR_CORROBORATION_MAX_FETCHES + BALANCE_RETRY  # запас на сетевые сбои
-    corroborated = False
-    tokens: list[dict] = []
-
-    while attempts < max_attempts and len(snapshots) < COLLECTOR_CORROBORATION_MAX_FETCHES:
-        if stop_event.is_set():
-            return {}
-        attempts += 1
-        try:
-            snap_tokens = await loop.run_in_executor(None, balance_client.get_tokens, address)
-        except Exception as e:
-            last_exc = e
-            await asyncio.sleep(3)
-            continue
-        snapshots.append({
-            "total_usd": _tokens_total_usd(snap_tokens),
-            "tokens": snap_tokens if isinstance(snap_tokens, list) else [],
-        })
-        cluster = _agreeing_cluster(snapshots)
-        if cluster is not None:
-            tokens = _representative(cluster)["tokens"]
-            corroborated = True
-            break
-
-    if not corroborated:
-        if not snapshots:
-            logger.error("[%s] Rabby failed after %d attempts: %s", address[:10], attempts, last_exc)
-            return {}
-        tokens = _conservative_pick(snapshots)["tokens"]
+    # ШАГ 1: Проверенные балансы (защита от фантомов — balance_verifier):
+    # токены из cache_token_list, каждый ≥ $0.5 подтверждён on-chain; список
+    # принимается, когда сошлись 2 независимые выборки через разные прокси.
+    verified = await loop.run_in_executor(
+        None,
+        lambda: check_wallet(address, proxy_rotator, stop_event, with_positions=False),
+    )
+    if stop_event.is_set():
+        return {}
+    if verified["status"] == "ERROR":
+        logger.error("[%s] Rabby balances failed: %s", address[:10], verified["error"])
+        return {}
+    tokens: list[dict] = verified["tokens"]
+    for note in verified["notes"]:
+        logger.info("[Wallet %s] %s", address[:10], note)
+    if verified["status"] == "UNVERIFIED":
+        # Все токены в списке подтверждены on-chain (фантомов нет), но выборки
+        # не сошлись — возможно, часть токенов кошелька не попала в список.
         logger.warning(
-            "[Wallet %s] Rabby balances NOT corroborated after %d fetches "
-            "(no >=%d agreement on total_usd) — берём консервативный снимок ($%.2f); "
-            "возможен фантом, своп идёт только по on-chain balanceOf",
-            address[:10], len(snapshots), COLLECTOR_CORROBORATION_MIN_AGREE,
-            _tokens_total_usd(tokens),
+            "[Wallet %s] Rabby balances NOT corroborated (%s) — берём консервативный "
+            "список ($%.2f), своп идёт только по on-chain balanceOf",
+            address[:10], verified["error"], verified["tokens_usd"],
         )
 
     # Группируем по chain
@@ -285,6 +254,8 @@ async def fetch_and_swap(
     chains_processed: list[str] = []
     chains_skipped: list[str] = []
     tokens_swapped = 0
+    swaps_attempted = 0          # свопы, для которых реально ушла транзакция
+    ops: list[dict] = []         # все отправленные транзакции (approve/swap) — для экспорта
     total_usd = 0.0
     gasless_map: dict[int, dict] = {}  # chain_id → {chain_id, debank_key, eth_balance, max_gas_needed_wei, native_token_addr, tokens}
 
@@ -355,6 +326,11 @@ async def fetch_and_swap(
 
             contract = _resolve_contract(token)
             decimals = token.get("decimals", 18)
+            log_prefix = f"[Wallet {address[:10]}] [{debank_key}]"
+
+            if is_bad(chain_id, contract):
+                logger.info("%s Skip %s: in blocklist — swap reverted before (can't be sold)", log_prefix, symbol)
+                continue
 
             # Получаем w3 и реальный on-chain баланс — кэш Rabby может быть устаревшим
             try:
@@ -427,6 +403,14 @@ async def fetch_and_swap(
 
                 tx_req = quote["transactionRequest"]
 
+                # Approve уже выдан → симулируем своп сразу, ДО проверки газа:
+                # непродаваемый токен не должен вызывать refuel.
+                allowance_ok = await _has_allowance(loop, w3, contract, address, tx_req.get("to", ""), from_amount)
+                if allowance_ok and not await _swap_simulation_ok(
+                    loop, w3, tx_req, address, chain_id, contract, symbol, log_prefix,
+                ):
+                    continue
+
                 gas_limit, effective_gas_price, tx_value, l1_data_fee = await _estimate_swap_tx_cost(
                     loop, w3, tx_req
                 )
@@ -467,8 +451,10 @@ async def fetch_and_swap(
                 approval_done = not bool(spender)
                 if spender:
                     approved = await loop.run_in_executor(
-                        None, ensure_erc20_approval,
-                        w3, contract, address, spender, from_amount, private_key,
+                        None, lambda: ensure_erc20_approval(
+                            w3, contract, address, spender, from_amount, private_key,
+                            ops=ops, chain=debank_key, label=symbol,
+                        ),
                     )
                     if not approved:
                         logger.error(
@@ -478,19 +464,41 @@ async def fetch_and_swap(
                         continue
                     approval_done = True
 
-                tx_hash, receipt = await loop.run_in_executor(
-                    None, sign_and_send, w3, tx_req, private_key, address
-                )
+                # Симуляция после свежего approve (до него своп откатился бы в любом случае)
+                if not allowance_ok and not await _swap_simulation_ok(
+                    loop, w3, tx_req, address, chain_id, contract, symbol, log_prefix,
+                ):
+                    continue
+
+                swaps_attempted += 1
+                swap_op = {"type": "swap", "chain": debank_key, "detail": f"{symbol} → native",
+                           "usd": round(value_usd, 4), "tx": "", "status": "PENDING"}
+                ops.append(swap_op)
+                try:
+                    tx_hash, receipt = await loop.run_in_executor(
+                        None, sign_and_send, w3, tx_req, private_key, address
+                    )
+                except TransactionReverted as e:
+                    swap_op.update(tx=e.tx_hash, status="REVERTED")
+                    logger.error("[Wallet %s] [%s] Swap %s reverted: %s", address[:10], debank_key, symbol, e.tx_hash)
+                    continue
+                except Exception:
+                    ops.remove(swap_op)  # tx не ушла (нода отклонила) — не попытка
+                    swaps_attempted -= 1
+                    raise
+                swap_op["tx"] = tx_hash
 
                 if receipt is None:
-                    # Таймаут ожидания — транзакция может быть pending, не reverted
+                    # Не попала в блок за время ожидания — исход неизвестен
                     logger.warning(
-                        "[Wallet %s] [%s] Swap tx pending (receipt timeout): %s",
+                        "[Wallet %s] [%s] Swap tx not confirmed: %s",
                         address[:10], debank_key, tx_hash,
                     )
                     continue
 
-                logger.info(
+                swap_op["status"] = "CONFIRMED"
+                logger.log(
+                    SUCCESS,
                     "[Wallet %s] [%s] Swap %s → native | tx: %s | confirmed in block %s",
                     address[:10], debank_key, symbol, tx_hash, receipt.blockNumber
                 )
@@ -574,8 +582,10 @@ async def fetch_and_swap(
         "chains_processed": ", ".join(chains_processed),
         "chains_skipped": ", ".join(chains_skipped),
         "tokens_swapped": tokens_swapped,
+        "swaps_attempted": swaps_attempted,
         "total_collected_usd": round(total_usd, 2),
         "gasless_chains": list(gasless_map.values()),
+        "ops": ops,
     }
 
 
@@ -594,15 +604,22 @@ async def retry_gasless_swaps(
     """
     ШАГ 2.6: повторный своп токенов на цепях, которые были рефьюелены.
     Не вызывает Rabby — использует список токенов из gasless_chains.
-    Возвращает {chains_processed, tokens_swapped, total_usd}.
+    Возвращает {chains_processed, tokens_swapped, swaps_attempted, total_usd, ops}.
     """
     from app.integrations.lifi_client import DEBANK_TO_CHAIN_ID, LiFiNoRouteError
-    from app.modules.token_collector._signer import sign_and_send, ensure_erc20_approval, InsufficientFundsError
+    from app.modules.token_collector._signer import (
+        sign_and_send, ensure_erc20_approval, InsufficientFundsError, TransactionReverted,
+    )
+    from app.modules.token_collector._bad_tokens import is_bad
+    from app.core.logger import SUCCESS
 
     loop = asyncio.get_running_loop()
     chains_processed: list[str] = []
     tokens_swapped = 0
+    swaps_attempted = 0
+    ops: list[dict] = []
     total_usd = 0.0
+    APPROVE_GAS_BUFFER = 100_000
 
     _ERC20_BALANCE_ABI = [{"inputs": [{"name": "account", "type": "address"}],
                            "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
@@ -637,6 +654,9 @@ async def retry_gasless_swaps(
 
             if value_usd < settings.min_token_usd:
                 continue
+            if is_bad(chain_id, contract):
+                logger.info("[Retry] [%s] Skip %s: in blocklist", debank_key, symbol)
+                continue
 
             # Актуальный on-chain баланс
             try:
@@ -670,19 +690,24 @@ async def retry_gasless_swaps(
                     from_amount, address, address, settings.slippage,
                 )
                 tx_req = quote["transactionRequest"]
+                log_prefix = f"[Retry] [{debank_key}]"
+                allowance_ok = await _has_allowance(loop, w3, contract, address, tx_req.get("to", ""), from_amount)
+                if allowance_ok and not await _swap_simulation_ok(
+                    loop, w3, tx_req, address, chain_id, contract, symbol, log_prefix,
+                ):
+                    continue
 
-                # Простая проверка газа
-                def _hi(v) -> int:
-                    if not v:
-                        return 0
-                    if isinstance(v, str):
-                        return int(v, 16) if v.startswith("0x") else int(v)
-                    return int(v)
-
-                gas_limit = _hi(tx_req.get("gasLimit") or tx_req.get("gas"))
-                gas_price = _hi(tx_req.get("maxFeePerGas") or tx_req.get("gasPrice") or 0)
-                tx_value = _hi(tx_req.get("value"))
-                eth_needed = tx_value + gas_limit * gas_price * 2
+                # Та же оценка, что и в основном проходе: свежий baseFee + L1 fee
+                # (maxFeePerGas из котировки бывает заглушкой) + резерв на approve.
+                gas_limit, effective_gas_price, tx_value, l1_data_fee = await _estimate_swap_tx_cost(
+                    loop, w3, tx_req
+                )
+                approve_reserve = APPROVE_GAS_BUFFER * effective_gas_price
+                if tx_req.get("to"):
+                    approve_reserve += l1_data_fee
+                eth_needed = int(
+                    (tx_value + gas_limit * effective_gas_price + l1_data_fee + approve_reserve) * 1.1
+                )
                 eth_balance = await loop.run_in_executor(None, w3.eth.get_balance, address)
 
                 if eth_balance < eth_needed:
@@ -695,19 +720,44 @@ async def retry_gasless_swaps(
                 spender = tx_req.get("to", "")
                 if spender:
                     approved = await loop.run_in_executor(
-                        None, ensure_erc20_approval,
-                        w3, contract, address, spender, from_amount, private_key,
+                        None, lambda: ensure_erc20_approval(
+                            w3, contract, address, spender, from_amount, private_key,
+                            ops=ops, chain=debank_key, label=symbol,
+                        ),
                     )
                     if not approved:
+                        logger.error("[Retry] [%s] Approve failed for %s, skipping swap", debank_key, symbol)
                         continue
 
-                tx_hash, receipt = await loop.run_in_executor(
-                    None, sign_and_send, w3, tx_req, private_key, address
-                )
-                if receipt is None:
+                if not allowance_ok and not await _swap_simulation_ok(
+                    loop, w3, tx_req, address, chain_id, contract, symbol, log_prefix,
+                ):
                     continue
 
-                logger.info(
+                swaps_attempted += 1
+                swap_op = {"type": "swap", "chain": debank_key, "detail": f"{symbol} → native",
+                           "usd": round(value_usd, 4), "tx": "", "status": "PENDING"}
+                ops.append(swap_op)
+                try:
+                    tx_hash, receipt = await loop.run_in_executor(
+                        None, sign_and_send, w3, tx_req, private_key, address
+                    )
+                except TransactionReverted as e:
+                    swap_op.update(tx=e.tx_hash, status="REVERTED")
+                    logger.error("[Retry] [%s] Swap %s reverted: %s", debank_key, symbol, e.tx_hash)
+                    continue
+                except Exception:
+                    ops.remove(swap_op)
+                    swaps_attempted -= 1
+                    raise
+                swap_op["tx"] = tx_hash
+                if receipt is None:
+                    logger.warning("[Retry] [%s] Swap tx not confirmed: %s", debank_key, tx_hash)
+                    continue
+
+                swap_op["status"] = "CONFIRMED"
+                logger.log(
+                    SUCCESS,
                     "[Retry] [%s] Swap %s → native | tx: %s | block %s",
                     debank_key, symbol, tx_hash, receipt.blockNumber,
                 )
@@ -735,5 +785,7 @@ async def retry_gasless_swaps(
     return {
         "chains_processed": ", ".join(chains_processed),
         "tokens_swapped": tokens_swapped,
+        "swaps_attempted": swaps_attempted,
         "total_usd": round(total_usd, 2),
+        "ops": ops,
     }

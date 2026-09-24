@@ -15,6 +15,9 @@ from app.integrations.twitter_client import (
 )
 
 RETRY_ATTEMPTS = 3
+# Прокси, отвергший подключение (407) или не ответивший, на это время
+# исключается из ротации — следующие токены его не ждут.
+DEAD_PROXY_COOLDOWN_SEC = 300
 
 
 def _check_token_sync(
@@ -45,6 +48,12 @@ def _check_token_sync(
 
         try:
             r = TwitterClient(proxy.to_url()).check_token(token)
+
+            if r.proxy_dead:
+                # Сбой прокси/сети (не ответ Twitter) — убираем IP и пробуем другой.
+                rotator.cooldown(proxy.to_url(), DEAD_PROXY_COOLDOWN_SEC)
+                last_error = "proxy error"
+                continue
 
             if r.status == TwitterTokenStatus.OK:
                 return Result(
@@ -130,6 +139,7 @@ class TwitterCheckerModule(BaseModule):
         try:
             for fut in asyncio.as_completed(tasks):
                 if self._stop_event.is_set():
+                    fut.close()  # as_completed yields coroutines; close unawaited one
                     for t in tasks:
                         t.cancel()
                     break

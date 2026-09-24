@@ -17,12 +17,14 @@ _STATUS_COLORS = {
     "ok":    QColor("#30D158"),
     "error": QColor("#FF453A"),
     "skip":  QColor("#F0C040"),
+    "unverified": QColor("#FF9F0A"),
 }
 
 _STATUS_BG = {
     "ok":    QColor(48, 209, 88, 25),
     "error": QColor(255, 69, 58, 25),
     "skip":  QColor(240, 192, 64, 25),
+    "unverified": QColor(255, 159, 10, 25),
 }
 
 _ALT_ROW_COLOR = QColor(255, 255, 255, 6)
@@ -198,7 +200,9 @@ class ResultsTable(QWidget):
         self._update_stats()
 
     def _update_total(self) -> None:
-        total = sum(r.data.get("total_usd", 0) for r in self._results if r.data)
+        # UNVERIFIED — значение не подтверждено, в итог не входит.
+        total = sum(r.data.get("total_usd", 0) for r in self._results
+                    if r.data and r.status != ResultStatus.UNVERIFIED)
         if total > 0:
             self._total_label.setText(tr("total_fmt").format(total=total))
             self._total_label.setVisible(True)
@@ -209,11 +213,14 @@ class ResultsTable(QWidget):
         ok = sum(1 for r in self._results if r.status == ResultStatus.OK)
         err = sum(1 for r in self._results if r.status == ResultStatus.ERROR)
         skip = sum(1 for r in self._results if r.status == ResultStatus.SKIP)
+        unverified = sum(1 for r in self._results if r.status == ResultStatus.UNVERIFIED)
         parts = [f"✓ {ok}"]
         if err:
             parts.append(f"✗ {err}")
         if skip:
             parts.append(f"⊘ {skip}")
+        if unverified:
+            parts.append(f"⚠ {unverified}")
         self._stats_label.setText("  │  ".join(parts))
         self._stats_label.setVisible(True)
 

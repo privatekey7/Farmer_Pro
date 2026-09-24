@@ -421,7 +421,10 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(False)
 
         cached = self._results_table.snapshot()
-        has_errors = any(r.status.value == "error" for r in cached)
+        has_errors = (
+            getattr(self._current_module, "item_errors_are_failures", True)
+            and any(r.status.value == "error" for r in cached)
+        )
         status = "error" if has_errors else "done"
 
         if self._current_module:

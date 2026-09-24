@@ -138,6 +138,7 @@ class DiscordTokenCheckerModule(BaseModule):
         try:
             for fut in asyncio.as_completed(tasks):
                 if self._stop_event.is_set():
+                    fut.close()  # as_completed yields coroutines; close unawaited one
                     for t in tasks:
                         t.cancel()
                     break

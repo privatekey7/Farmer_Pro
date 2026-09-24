@@ -1,6 +1,7 @@
 # app/integrations/lifi_client.py
 from __future__ import annotations
 import logging
+import threading
 import time
 from dataclasses import dataclass
 
@@ -163,6 +164,17 @@ class LiFiClient:
             proxy=proxy,
             timeout=30.0,
         )
+        # Маршруты между сетями за время прогона не меняются, а спрашивались
+        # перед КАЖДЫМ токеном — кэш на время жизни клиента (один прогон).
+        self._connections_cache: dict[tuple[int, int, str], list[dict]] = {}
+        self._connections_lock = threading.Lock()
+
+    def for_proxy(self, proxy: str | None) -> "LiFiClient":
+        """Клиент через другой прокси с тем же кэшем маршрутов (свой IP на кошелёк)."""
+        clone = LiFiClient(proxy=proxy)
+        clone._connections_cache = self._connections_cache
+        clone._connections_lock = self._connections_lock
+        return clone
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         """GET запрос с retry (3 попытки, задержка 3с)."""
@@ -202,13 +214,21 @@ class LiFiClient:
         return self._get("/tools")
 
     def get_connections(self, from_chain: int, to_chain: int, chain_types: str = "EVM") -> list[dict]:
-        """GET /connections — проверка существования маршрута."""
+        """GET /connections — проверка существования маршрута (кэш на прогон)."""
+        key = (from_chain, to_chain, chain_types)
+        with self._connections_lock:
+            cached = self._connections_cache.get(key)
+        if cached is not None:
+            return cached
         data = self._get("/connections", {
             "fromChain": from_chain,
             "toChain": to_chain,
             "chainTypes": chain_types,
         })
-        return data.get("connections", [])
+        connections = data.get("connections", [])
+        with self._connections_lock:
+            self._connections_cache[key] = connections
+        return connections
 
     def get_gas_prices(self) -> dict:
         """GET /gas/prices — текущие цены газа по всем сетям (в wei)."""

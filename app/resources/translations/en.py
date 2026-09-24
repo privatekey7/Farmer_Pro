@@ -104,6 +104,10 @@ TRANSLATIONS: dict[str, str] = {
     "delay_min_tooltip": "Minimum delay between processing wallets",
     "delay_max_tooltip": "Maximum delay between processing wallets",
     "after_bridge_delay_tooltip": "Wait time after bridge before next operation",
+    "parallel_wallets_label": "Wallets at once:",
+    "parallel_wallets_tooltip": "How many wallets to process in parallel. Delays after swaps, bridges and between wallets apply within each worker. 1 — strictly one by one, as before",
+    "exchange_pct_label": "Amount to exchange (% of balance):",
+    "exchange_pct_tooltip": "Percent of the available balance on the target chain (minus transfer gas). From = To — fixed percent; different values — a random percent in the range for each wallet. 100% — send everything",
     "min_bridge_tooltip": "Skip bridge if balance is below this USD value",
 
     # Sidebar

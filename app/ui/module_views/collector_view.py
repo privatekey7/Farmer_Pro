@@ -27,6 +27,9 @@ class CollectorSettings:
     delay_max: int                # default 30
     send_to_exchange: bool
     delay_after_bridge: int       # default 60
+    parallel_wallets: int = 1     # кошельков одновременно (паузы — внутри каждого)
+    exchange_pct_min: int = 100   # % доступного баланса на биржу (целый, 1–100): «от»
+    exchange_pct_max: int = 100   # «до»; равны — фиксированный процент
 
 
 class CollectorConfigWidget(QWidget):
@@ -163,6 +166,18 @@ class CollectorConfigWidget(QWidget):
         delay_row.addStretch()
         dg.addLayout(delay_row)
 
+        parallel_row = QHBoxLayout()
+        self._lbl_parallel_wallets = QLabel()
+        parallel_row.addWidget(self._lbl_parallel_wallets)
+        self._parallel_wallets = QSpinBox()
+        self._parallel_wallets.setRange(1, 20)
+        self._parallel_wallets.setValue(1)
+        self._parallel_wallets.setFixedWidth(86)
+        self._parallel_wallets.setToolTip(tr("parallel_wallets_tooltip"))
+        parallel_row.addWidget(self._parallel_wallets)
+        parallel_row.addStretch()
+        dg.addLayout(parallel_row)
+
         layout.addWidget(self._grp_delays)
 
         # --- Субаккаунт биржи ---
@@ -193,6 +208,24 @@ class CollectorConfigWidget(QWidget):
         delay_bridge_row.addWidget(self._delay_after_bridge)
         delay_bridge_row.addStretch()
         eg.addLayout(delay_bridge_row)
+
+        # Сумма на биржу: % от доступного баланса (от–до; равны — фиксированный)
+        exchange_pct_row = QHBoxLayout()
+        self._lbl_exchange_pct = QLabel()
+        exchange_pct_row.addWidget(self._lbl_exchange_pct)
+        self._exchange_pct_min = QSpinBox()
+        self._exchange_pct_max = QSpinBox()
+        for spin in (self._exchange_pct_min, self._exchange_pct_max):
+            spin.setRange(1, 100)
+            spin.setValue(100)
+            spin.setFixedWidth(86)
+            spin.setEnabled(False)
+            spin.setToolTip(tr("exchange_pct_tooltip"))
+        exchange_pct_row.addWidget(self._exchange_pct_min)
+        exchange_pct_row.addWidget(QLabel("—"))
+        exchange_pct_row.addWidget(self._exchange_pct_max)
+        exchange_pct_row.addStretch()
+        eg.addLayout(exchange_pct_row)
 
         layout.addWidget(self._grp_exchange)
 
@@ -230,10 +263,15 @@ class CollectorConfigWidget(QWidget):
         self._lbl_min_bridge.setText(tr("min_value_label"))
         self._grp_delays.setTitle(tr("delays_group"))
         self._lbl_delay_between_wallets.setText(tr("delay_between_wallets_label"))
+        self._lbl_parallel_wallets.setText(tr("parallel_wallets_label"))
+        self._parallel_wallets.setToolTip(tr("parallel_wallets_tooltip"))
         self._grp_exchange.setTitle(tr("exchange_group"))
         self._send_to_exchange.setText(tr("send_to_exchange_checkbox"))
         self._sub_drop.set_label(tr("subaccounts_label"))
         self._lbl_after_bridge_delay.setText(tr("after_bridge_delay_label"))
+        self._lbl_exchange_pct.setText(tr("exchange_pct_label"))
+        self._exchange_pct_min.setToolTip(tr("exchange_pct_tooltip"))
+        self._exchange_pct_max.setToolTip(tr("exchange_pct_tooltip"))
         self._grp_export.setTitle(tr("export_group"))
         self._btn_csv.setText(tr("save_csv"))
         self._btn_json.setText(tr("save_json"))
@@ -293,6 +331,8 @@ class CollectorConfigWidget(QWidget):
     def _on_exchange_toggled(self, checked: bool) -> None:
         self._sub_drop.setEnabled(checked)
         self._delay_after_bridge.setEnabled(checked)
+        self._exchange_pct_min.setEnabled(checked)
+        self._exchange_pct_max.setEnabled(checked)
         self._check_wallet_subaccount_match()
 
     # --- Публичные методы ---
@@ -319,6 +359,11 @@ class CollectorConfigWidget(QWidget):
             delay_max=self._delay_max.value(),
             send_to_exchange=self._send_to_exchange.isChecked(),
             delay_after_bridge=self._delay_after_bridge.value(),
+            parallel_wallets=self._parallel_wallets.value(),
+            # Поля друг друга не правят (иначе ввод «98» сбрасывался уже на «9»);
+            # «от» > «до» — просто меняем местами.
+            exchange_pct_min=min(self._exchange_pct_min.value(), self._exchange_pct_max.value()),
+            exchange_pct_max=max(self._exchange_pct_min.value(), self._exchange_pct_max.value()),
         )
 
     def on_run_complete(self, results: list, details: dict) -> None:
@@ -341,51 +386,66 @@ class CollectorConfigWidget(QWidget):
             return
         import json, csv
 
-        # Build summary rows (bridge_ops excluded — shown in separate Bridges sheet/section)
+        # Сводка по кошелькам + лист Operations: ВСЕ отправленные транзакции
+        # (approve / swap / refuel / bridge / exchange) с хэшем и статусом —
+        # сверяется с историей кошелька в Rabby один к одному. Модуль кладёт их
+        # в "_detail_ops"; служебные поля "_…" в сводку не идут.
         summary_rows = []
-        bridge_rows = []
+        op_rows = []
         for r in self._export_results:
-            data = dict(r.data)
-            ops = data.pop("bridge_ops", []) or []
-            bridge_count = len(ops)
-            summary_rows.append({"item": r.item, "status": r.status.value,
-                                  "bridges": bridge_count, **data})
+            ops = r.data.get("_detail_ops") or []
+            data = {k: v for k, v in r.data.items() if not k.startswith("_")}
+            summary_rows.append({"item": r.item, "status": r.status.value, **data})
             for op in ops:
-                bridge_rows.append({
+                op_rows.append({
                     "address": r.item,
-                    "src_chain": op.get("src", ""),
-                    "tgt_chain": op.get("tgt", ""),
+                    "type": op.get("type", ""),
+                    "chain": op.get("chain", ""),
+                    "detail": op.get("detail", ""),
+                    "usd": op.get("usd", 0),
                     "tx_hash": op.get("tx", ""),
                     "status": op.get("status", ""),
-                    "sent_usd": op.get("usd", 0),
                 })
 
         total_usd = sum(r.data.get("total_collected_usd", 0) or 0 for r in self._export_results)
+        total_swapped = sum(r.data.get("swapped_usd", 0) or 0 for r in self._export_results)
+        total_refuel = sum(r.data.get("refuel_usd", 0) or 0 for r in self._export_results)
+        # Колонки — объединение по всем строкам: у кошельков с ошибкой/без бриджа
+        # полей меньше, и DictWriter по первой строке падал на следующих.
+        summary_fields: list[str] = []
+        for row in summary_rows:
+            for key in row:
+                if key not in summary_fields:
+                    summary_fields.append(key)
 
         if fmt == "json":
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({
                     "total_collected_usd": round(total_usd, 2),
+                    "total_swapped_usd": round(total_swapped, 2),
+                    "total_refuel_usd": round(total_refuel, 2),
                     "summary": summary_rows,
-                    "bridges": bridge_rows,
+                    "operations": op_rows,
                 }, f, ensure_ascii=False, indent=2)
 
         elif fmt == "csv":
             if summary_rows:
                 with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                    writer = csv.DictWriter(f, fieldnames=summary_rows[0].keys())
+                    writer = csv.DictWriter(f, fieldnames=summary_fields, restval="")
                     writer.writeheader()
                     writer.writerows(summary_rows)
                     writer.writerow({})
-                    writer.writerow({"item": "TOTAL", "total_collected_usd": round(total_usd, 2)})
-                    if bridge_rows:
+                    totals = {"swapped_usd": total_swapped, "refuel_usd": total_refuel}
+                    writer.writerow({"item": "TOTAL", "total_collected_usd": round(total_usd, 2),
+                                     **{k: round(v, 2) for k, v in totals.items() if k in summary_fields}})
+                    if op_rows:
                         writer.writerow({})
-                        writer.writerow({"item": "=== BRIDGES ==="})
+                        writer.writerow({"item": "=== OPERATIONS ==="})
                 with open(path, "a", newline="", encoding="utf-8-sig") as f:
-                    if bridge_rows:
-                        writer = csv.DictWriter(f, fieldnames=bridge_rows[0].keys())
+                    if op_rows:
+                        writer = csv.DictWriter(f, fieldnames=op_rows[0].keys())
                         writer.writeheader()
-                        writer.writerows(bridge_rows)
+                        writer.writerows(op_rows)
 
         elif fmt == "xlsx":
             try:
@@ -402,28 +462,32 @@ class CollectorConfigWidget(QWidget):
             ws1 = wb.active
             ws1.title = "Summary"
             if summary_rows:
-                header = list(summary_rows[0].keys())
+                header = summary_fields
                 ws1.append(header)
                 for cell in ws1[1]:
                     cell.font = Font(bold=True)
                 for row in summary_rows:
-                    ws1.append(list(row.values()))
+                    ws1.append([row.get(h, "") for h in header])
                 ws1.append([])
                 total_row = ["TOTAL"] + [""] * (len(header) - 1)
                 if "total_collected_usd" in header:
                     total_row[header.index("total_collected_usd")] = round(total_usd, 2)
+                if "swapped_usd" in header:
+                    total_row[header.index("swapped_usd")] = round(total_swapped, 2)
+                if "refuel_usd" in header:
+                    total_row[header.index("refuel_usd")] = round(total_refuel, 2)
                 ws1.append(total_row)
                 for cell in ws1[ws1.max_row]:
                     cell.font = Font(bold=True)
 
-            # ── Sheet 2: Bridges ─────────────────────────────────────────
-            ws2 = wb.create_sheet("Bridges")
-            if bridge_rows:
-                b_header = list(bridge_rows[0].keys())
-                ws2.append(b_header)
+            # ── Sheet 2: Operations (все отправленные транзакции) ──────────
+            ws2 = wb.create_sheet("Operations")
+            if op_rows:
+                o_header = list(op_rows[0].keys())
+                ws2.append(o_header)
                 for cell in ws2[1]:
                     cell.font = Font(bold=True)
-                for row in bridge_rows:
+                for row in op_rows:
                     ws2.append(list(row.values()))
 
             try:

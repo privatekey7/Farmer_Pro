@@ -2,9 +2,9 @@
 from __future__ import annotations
 import threading
 import time
+from typing import Any
 
-import curl_cffi.requests as cffi_requests
-
+from app.integrations import http_pool
 from app.integrations.api_signer import RABBY_SIGN_PREFIX, sign_request
 
 API_BASE = "https://api.rabby.io"
@@ -20,7 +20,9 @@ API_KEY_INIT_TIME = 1762656362
 # Версия клиента Rabby, под которую записан HAR расширения.
 CLIENT_VERSION = "0.94.2"
 
-# Общий на процесс магазин ключа: клиенты кэшируются per-thread, но при
+REQUEST_TIMEOUT = 8.0
+
+# Общий на процесс магазин ключа: клиент создаётся на каждую выборку, но при
 # ротации сервером ключ терять нельзя — иначе новые клиенты снова начнут с
 # init-ключа. Все клиенты продолжают с последнего выданного ключа; время
 # выдачи ротированного ключа — момент ротации.
@@ -54,14 +56,9 @@ def _is_core_token(token: dict) -> bool:
 class RabbyClient:
     """Клиент Rabby API (api.rabby.io). Прокси обязателен.
 
-    Отличия от старого DeBank-клиента (проверено HAR):
-      - префикс подписи ``rabby-api`` (у DeBank был ``debank-api``);
-      - идентификация через ``x-client: Rabby`` + ``x-version``
-        (без ``account``/``source``/``Referer``);
-      - параметр адреса — ``id`` (lowercase);
-      - итог берётся из ``/v1/user/total_balance`` (``total_usd_value``) —
-        готовый агрегат, ручного суммирования нет, что устраняет корневой
-        сценарий фантомных балансов DeBank.
+    Отдаёт ответы эндпоинтов как есть. ВНИМАНИЕ: с 11.09.2026 total_balance,
+    complex_app_list и token_list для части адресов возвращают ЧУЖИЕ данные —
+    итог из них не берётся, проверка — в ``balance_verifier``.
 
     Заголовки идентификации должны ТОЧНО повторять клиент Rabby (сверено с
     HAR браузерного расширения): подписные заголовки — в нижнем регистре,
@@ -69,23 +66,17 @@ class RabbyClient:
     досылаются браузерные заголовки. Анти-бот API на любое отклонение
     отвечает фейковым 429 с пустым телом при верной подписи (разбор инцидента
     — docs/incident-429-antibot.md в DeBankChecker).
+
+    HTTP идёт через общий пул keep-alive сессий (``http_pool``): клиент
+    дешёвый, создаётся на каждую выборку. 429/5xx не повторяются здесь —
+    выборку повторяет верификатор уже через другой прокси.
     """
 
-    REQUEST_TIMEOUT: float = 15.0
-
-    def __init__(self, proxy: str, impersonate: str = "chrome124") -> None:
+    def __init__(self, proxy: str) -> None:
         if not proxy:
             raise ValueError("Прокси обязателен для Rabby API")
+        self._proxy = proxy
         self._api_key, self._key_time = _current_key()
-        self._session = cffi_requests.Session(
-            impersonate=impersonate,
-            proxies={"https": proxy, "http": proxy},
-        )
-        # Снимок последнего total_balance: get_tokens ВСЕГДА запрашивает свежий
-        # (иначе повторные выборки корроборации не были бы независимыми),
-        # а следующий за ним get_total_usd читает тот же снимок, чтобы токены
-        # и итог относились к одному ответу API (и не тратить лишний запрос).
-        self._total_balance_snapshot: dict[str, dict] = {}
 
     def _build_headers(self, params: dict, method: str, path: str) -> dict:
         # Состав и кейсинг — строго по HAR расширения Rabby: отклонение
@@ -110,14 +101,15 @@ class RabbyClient:
             "x-version": CLIENT_VERSION,
         }
 
-    def _get(self, path: str, params: dict | None = None) -> dict | list:
+    def _get(self, path: str, params: dict | None = None) -> Any:
         params = params or {}
         headers = self._build_headers(params, "GET", path)
-        resp = self._session.get(
+        resp = http_pool.get(
             API_BASE + path,
+            self._proxy,
             params=params,
             headers=headers,
-            timeout=self.REQUEST_TIMEOUT,
+            timeout=REQUEST_TIMEOUT,
         )
 
         # Ротация ключа читается ДО raise_for_status: сервер может выдать
@@ -130,23 +122,19 @@ class RabbyClient:
         resp.raise_for_status()
 
         data = resp.json()
-        if isinstance(data, dict) and set(data.keys()) <= {"data", "error_code"}:
+        if isinstance(data, dict) and "data" in data and set(data.keys()) <= {"data", "error_code"}:
             return data["data"]
         return data
 
-    def _fetch_total_balance(self, address: str) -> dict:
-        """Агрегированный баланс + разбивка по сетям (ОДИН свежий запрос).
+    def get_total_balance(self, address: str) -> dict:
+        """Агрегат: ``{total_usd_value, chain_list: [{id, usd_value}]}``.
 
+        НЕ источник итога (бывает заражён чужими суммами) — только контроль и
+        подсказка, в каких сетях кэш токенов мог устареть.
         ``is_core=true`` отсекает скам/непроверенные токены — как галка в UI Rabby.
         """
-        addr = address.lower()
-        result = self._get(
-            "/v1/user/total_balance",
-            {"id": addr, "is_core": "true"},
-        )
-        result = result if isinstance(result, dict) else {}
-        self._total_balance_snapshot[addr] = result
-        return result
+        result = self._get("/v1/user/total_balance", {"id": address.lower(), "is_core": "true"})
+        return result if isinstance(result, dict) else {}
 
     def get_cache_token_list(self, address: str) -> list:
         """Токены кошелька по ВСЕМ сетям одним запросом (серверный кэш).
@@ -161,70 +149,8 @@ class RabbyClient:
             return []
         return [t for t in result if isinstance(t, dict) and _is_core_token(t)]
 
-    def get_tokens(self, address: str) -> list:
-        """Все core-токены кошелька по всем ненулевым сетям (свежая выборка).
-
-        Формат токена совместим с DeBank: ``id``/``chain``/``symbol``/
-        ``amount``/``price`` (нативные — ``id`` == ключ сети, не hex).
-
-        Схема: ``total_balance`` → ``cache_token_list`` (один запрос на все
-        сети); при сбое кэша — фолбэк на по-сетевой ``token_list``. Пустой
-        ``chain_list`` (пустой кошелёк) → запросы токенов не выполняются,
-        как поступает и расширение.
-        """
-        total = self._fetch_total_balance(address)
-        chain_list = total.get("chain_list", [])
-        if not isinstance(chain_list, list):
-            return []
-
-        chains = [
-            c.get("id") for c in chain_list
-            if isinstance(c, dict) and c.get("id")
-            and (c.get("usd_value") or 0) > 0
-        ]
-        if not chains:
-            return []
-
-        try:
-            return self.get_cache_token_list(address)
-        except Exception:
-            pass  # фолбэк: по-сетевой token_list (is_all=false → только core)
-
-        tokens: list = []
-        for chain_id in chains:
-            result = self._get(
-                "/v1/user/token_list",
-                {"id": address.lower(), "chain_id": chain_id, "is_all": "false"},
-            )
-            if isinstance(result, list):
-                tokens.extend(t for t in result if isinstance(t, dict) and _is_core_token(t))
-        return tokens
-
-    def get_total_usd(self, address: str) -> float:
-        """Итог кошелька из готового агрегата Rabby (токены + DeFi).
-
-        Использует снимок последнего ``get_tokens`` (тот же ответ API);
-        если его нет — делает свежий запрос.
-        """
-        total = self._total_balance_snapshot.get(address.lower())
-        if total is None:
-            total = self._fetch_total_balance(address)
-        try:
-            return float(total.get("total_usd_value") or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    # ── Быстрый путь (используется EVM Balance Checker) ─────────────────────
-    def fetch_total_balance(self, address: str) -> dict:
-        """Публичная «дешёвая» выборка: ОДИН запрос total_balance.
-
-        Содержит и итог (``total_usd_value``), и разбивку по сетям
-        (``chain_list``) — этого достаточно для корроборации, без token_list.
-        """
-        return self._fetch_total_balance(address)
-
     def get_token_list(self, address: str, chain_id: str) -> list:
-        """Список core-токенов одной сети (один запрос).
+        """Свежий список core-токенов одной сети (один запрос).
 
         Защищённый эндпоинт: не должен вызываться серийно (анти-бот);
         основной путь — ``get_cache_token_list``.
@@ -236,3 +162,17 @@ class RabbyClient:
         if not isinstance(result, list):
             return []
         return [t for t in result if isinstance(t, dict) and _is_core_token(t)]
+
+    def get_complex_app_list(self, address: str) -> list:
+        """DeFi-протоколы с позициями: ``portfolio_item_list`` со ``stats``/
+        ``asset_token_list``/``detail`` в формате DeBank."""
+        result = self._get("/v1/user/complex_app_list", {"id": address.lower()})
+        if isinstance(result, dict):
+            apps = result.get("apps", [])
+            return apps if isinstance(apps, list) else []
+        return result if isinstance(result, list) else []
+
+    def get_chain_list(self) -> list:
+        """Сети Rabby: ``id`` (строковый), ``community_id`` (EVM chain id), ``native_token_id``."""
+        result = self._get("/v1/chain/list")
+        return result if isinstance(result, list) else []

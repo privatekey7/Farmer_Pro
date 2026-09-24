@@ -10,6 +10,11 @@ _LONG_TOKEN_RE = re.compile(r"\S{31,}")  # строки >30 символов б�
 
 _LOG_DIR = Path("logs")
 
+# Уровень для подтверждённых успешных операций (своп, бридж, refuel, перевод):
+# между INFO (20) и WARNING (30). В UI-логе — зелёным.
+SUCCESS = 25
+logging.addLevelName(SUCCESS, "SUCCESS")
+
 
 def mask_sensitive(text: str) -> str:
     """Маскирует приватные ключи и длинные токены в тексте."""

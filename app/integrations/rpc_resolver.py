@@ -3,8 +3,27 @@ from __future__ import annotations
 import logging
 
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 logger = logging.getLogger(__name__)
+
+
+def make_web3(url: str, timeout: float = 10, proxy: str | None = None) -> Web3:
+    """Web3 с POA-middleware; proxy — весь трафик RPC через прокси (w3.farmer_proxy).
+
+    BSC, Polygon и другие POA-сети кладут в extraData блока больше 32 байт —
+    без middleware get_block падает (ExtraDataLengthError), и все расчёты газа
+    по baseFee тихо уходили в запасные пути. Для не-POA сетей middleware ничего
+    не меняет.
+    """
+    request_kwargs: dict = {"timeout": timeout}
+    if proxy:
+        request_kwargs["proxies"] = {"http": proxy, "https": proxy}
+    w3 = Web3(Web3.HTTPProvider(url, request_kwargs=request_kwargs))
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    # Прокси нужен и запасным путям (статус tx, повторная отправка) — через onchain
+    w3.farmer_proxy = proxy
+    return w3
 
 # Publicnode RPCs — стабильные публичные ноды, идут первыми в списке кандидатов.
 # Обновляй при добавлении новых цепей на https://publicnode.com
@@ -74,6 +93,21 @@ class RpcResolver:
 
         self._cache: dict[int, Web3] = {}
         self._failed: set[str] = set()  # плохие URL в рамках сессии
+        self._proxy: str | None = None
+
+    def for_proxy(self, proxy: str | None) -> "RpcResolver":
+        """Резолвер с тем же списком RPC, но весь трафик — через proxy.
+
+        Коллектор даёт каждому кошельку свой: запросы и транзакции разных
+        кошельков идут с разных IP (не с IP пользователя — блокировки по стране,
+        и кошельки не связываются по IP). Кэш соединений и «плохие» URL — свои.
+        """
+        clone = RpcResolver.__new__(RpcResolver)
+        clone._candidates = self._candidates
+        clone._cache = {}
+        clone._failed = set()
+        clone._proxy = proxy
+        return clone
 
     # ------------------------------------------------------------------
 
@@ -106,7 +140,7 @@ class RpcResolver:
             if url in self._failed:
                 continue
             try:
-                w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
+                w3 = make_web3(url, proxy=self._proxy)
                 if w3.is_connected():
                     logger.info("[RpcResolver] Connected chain %s via %s", chain_id, url)
                     self._cache[chain_id] = w3

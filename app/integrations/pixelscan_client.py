@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import time
 from app.core.models import ProxyConfig
 from app.integrations.http_client import build_client
@@ -6,7 +7,8 @@ from app.integrations.http_client import build_client
 PIXELSCAN_URL = "https://212133867.extension.pixelscan.net/"
 # Оригинальный URL содержит фрагмент (#212133867), который HTTP-клиенты
 # отбрасывают согласно RFC 3986.
-TIMEOUT = 15.0
+TIMEOUT = 8.0         # на фазу (connect / read); живые прокси отвечают за ~2.5 с
+TOTAL_TIMEOUT = 10.0  # на весь запрос: мёртвый прокси не держит проверку дольше
 
 PIXELSCAN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0",
@@ -23,9 +25,12 @@ async def check_quality(proxy: ProxyConfig) -> dict:
     Возвращает {"quality": "high"/"medium"/"low"/"unknown", "latency_ms": int}.
     Бросает исключение при недоступности прокси.
     """
-    t0 = time.monotonic()
     async with build_client(proxy, timeout=TIMEOUT) as client:
-        resp = await client.get(PIXELSCAN_URL, headers=PIXELSCAN_HEADERS)
+        # Замер — только сам запрос через прокси, без создания клиента.
+        t0 = time.monotonic()
+        resp = await asyncio.wait_for(
+            client.get(PIXELSCAN_URL, headers=PIXELSCAN_HEADERS), TOTAL_TIMEOUT
+        )
         resp.raise_for_status()
         latency_ms = round((time.monotonic() - t0) * 1000)
         try:

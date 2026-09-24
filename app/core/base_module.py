@@ -12,6 +12,10 @@ class BaseModule(ABC):
 
     name: str  # Отображаемое имя в боковом меню
 
+    # True — строка со статусом error означает сбой (прогон «завершён с
+    # ошибками»). False — это обычный итог проверки (мёртвый прокси и т.п.).
+    item_errors_are_failures: bool = True
+
     @abstractmethod
     def get_config_widget(self) -> "QWidget | None":
         """

@@ -8,6 +8,7 @@ class ResultStatus(Enum):
     OK = "ok"
     ERROR = "error"
     SKIP = "skip"
+    UNVERIFIED = "unverified"  # выборки не сошлись — значение не подтверждено
 
 
 @dataclass
