@@ -413,6 +413,11 @@ QPlainTextEdit {
   letter-spacing: 0.03em;
 }
 
+#sidebarVersion {
+  font-size: 8pt;
+  color: rgba(245,245,247,0.35);
+}
+
 #sidebarButton {
   background: transparent;
   border: none;

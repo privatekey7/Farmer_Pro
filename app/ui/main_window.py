@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, QUrl, QSettings
 from PySide6.QtGui import QDesktopServices, QShortcut, QKeySequence
 
+from app import __version__
 from app.core.base_module import BaseModule
 from app.core.module_registry import ModuleRegistry
 from app.core.models import RunContext, Result
@@ -34,7 +35,7 @@ def _pick_concurrency(proxy_count: int) -> int:
 class MainWindow(QMainWindow):
     def __init__(self, registry: ModuleRegistry) -> None:
         super().__init__()
-        self.setWindowTitle("FarmerPro")
+        self.setWindowTitle(f"FarmerPro v{__version__}")
         self.setMinimumSize(1200, 700)
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
 

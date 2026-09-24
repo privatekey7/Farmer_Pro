@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel, QSizePolicy,
 )
 
+from app import __version__
 from app.core.base_module import BaseModule
 from app.i18n import tr, i18n
 
@@ -134,6 +135,10 @@ class Sidebar(QWidget):
         self._title.setObjectName("sidebarTitle")
         self._title.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._title)
+        self._version = QLabel(f"v{__version__}")
+        self._version.setObjectName("sidebarVersion")
+        self._version.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._version)
         layout.addSpacing(12)
 
         # Module buttons
@@ -179,6 +184,7 @@ class Sidebar(QWidget):
         for btn in self._buttons:
             btn.setText(btn.module.name if self._expanded else "")
         self._title.setVisible(self._expanded)
+        self._version.setVisible(self._expanded)
 
     def set_module_status(self, module: BaseModule, status: str) -> None:
         """Set module status: 'running', 'done', 'error', '' (clear)."""

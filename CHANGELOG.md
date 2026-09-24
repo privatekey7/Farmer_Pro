@@ -6,7 +6,7 @@
 
 ## Русский
 
-### Обновление от 24.09.2026
+### Версия 1.1.0 — 24.09.2026
 
 #### EVM Balance Checker — только честные балансы
 - Балансы теперь **перепроверяются**: токены сверяются напрямую с блокчейном, а итог
@@ -67,7 +67,7 @@ pip install -r requirements.txt
 
 ## English
 
-### Update of 24.09.2026
+### Version 1.1.0 — 24.09.2026
 
 #### EVM Balance Checker — only honest balances
 - Balances are now **double-checked**: tokens are verified directly on-chain, and the

@@ -18,7 +18,7 @@ A modular desktop tool for managing crypto accounts and wallets.
 | Twitter Checker | Check Twitter/X account status |
 | Discord Token Checker | Check Discord token status |
 
-### What's new (24.09.2026)
+### What's new in v1.1.0 (24.09.2026)
 
 - **EVM Balance** — balances are double-checked on-chain, no more fake or inflated totals. New `unverified` status.
 - **Collector** — safer swaps, scam-token protection, own proxy per wallet, smarter bridging.
@@ -61,7 +61,7 @@ For detailed documentation visit: https://privatekey7.gitbook.io/farmerpro-en/
 | Twitter Checker | Проверка статуса Twitter/X аккаунтов |
 | Discord Token Checker | Проверка статуса Discord токенов |
 
-### Что нового (24.09.2026)
+### Что нового в v1.1.0 (24.09.2026)
 
 - **EVM Balance** — балансы перепроверяются в блокчейне, больше никаких фейковых или завышенных сумм. Новый статус `unverified`.
 - **Collector** — безопасные свапы, защита от токенов-ловушек, свой прокси на каждый кошелёк, выгодные бриджи.
