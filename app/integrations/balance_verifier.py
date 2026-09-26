@@ -7,7 +7,8 @@ docs/PHANTOM_BALANCES.md).
   * /v1/user/total_balance — агрегат с суммами чужого кошелька (одинаковые
     значения у разных адресов), «липнет» на минуты-часы — поэтому две выборки
     агрегата легко «сходятся» на фантоме;
-  * /v1/user/complex_app_list — случайные app-chain позиции (Hyperliquid,
+  * /v1/user/complex_app_list (+ complex_protocol_list — EVM DeFi-позиции,
+    стейкинг/LP/lending, без него они терялись) — случайные app-chain позиции (Hyperliquid,
     Lighter, Polymarket…) с нашим user_addr, но чужими суммами;
   * /v1/user/token_list, изредка cache_token_list — отдельные чужие токены,
     а иногда чужой список целиком.
@@ -46,6 +47,11 @@ MIN_VALUE_DISPLAY = 0.01
 # Сверка компонентов с агрегатом Rabby.
 COMPONENT_TOL_ABS = 1.0    # USD
 COMPONENT_TOL_REL = 0.02   # 2%
+PROTOCOL_CONFIRM_MAX = 8   # сколько протоколов подтверждать /v1/user/protocol за выборку
+# Протоколы дешевле этого (и сверх PROTOCOL_CONFIRM_MAX) не перезапрашиваются —
+# меньше запросов, меньше 429; принимаются, только если все проверенные
+# позиции списка подтвердились.
+PROTOCOL_CONFIRM_MIN_USD = 0.10
 CHAIN_REFETCH_MAX = 6      # сколько сетей перепроверять свежим token_list, если агрегат по сети выше токенов
 
 # On-chain проверка: токены ≥ ONCHAIN_MIN_USD подтверждаются
@@ -61,11 +67,15 @@ TAINT_ABS_USD = 5.0
 TAINT_REL = 0.10
 
 CORROBORATION_MIN_AGREE = 2    # сошедшихся выборок нужно для приёма
-CORROBORATION_MAX_FETCHES = 6  # бюджет выборок на кошелёк (включая хеджи)
+CORROBORATION_MAX_FETCHES = 10  # бюджет выборок на кошелёк (включая хеджи)
 CORROBORATION_REL_TOL = 0.02
 CORROBORATION_ABS_TOL = 1.0
 RETRY_ATTEMPTS = 10            # минимум попыток выборки (каждая — с новым прокси)
 RETRY_PROXY_BACKOFF_SEC = 0.3  # следующий повтор идёт с другого IP — ждать почти не нужно
+# Заражение Rabby «залипает» на адресе на ~10–20 с (соседние выборки через
+# разные прокси получают те же чужие данные) — после заражённой/неполной
+# выборки следующая запускается с паузой, чтобы выйти из этого окна.
+TAINTED_BACKOFF_SEC = 4.0
 PROXY_COOLDOWN_429_SEC = 15    # прокси с 429/403 от Rabby не выдаётся столько секунд
 PROXY_COOLDOWN_TIMEOUT_SEC = 60
 # Выборка, не завершившаяся за SNAPSHOT_HEDGE_SEC, дублируется новой через
@@ -274,6 +284,120 @@ def _safe_position_value(item: dict) -> float:
     return min(api_value, recalc)
 
 
+def _merge_portfolio(apps: list[dict], protocols: list[dict]) -> list[dict]:
+    """complex_app_list (app-позиции) + complex_protocol_list (EVM DeFi:
+    стейкинг, LP, lending). Если протокол есть в обоих списках, его EVM-позиции
+    берутся из complex_protocol_list, а из complex_app_list — только app-chain
+    (без сети), чтобы одна позиция не посчиталась дважды."""
+    proto_ids = {p.get("id") for p in protocols or [] if isinstance(p, dict)}
+    merged = [p for p in protocols or [] if isinstance(p, dict)]
+    for app in apps or []:
+        if not isinstance(app, dict):
+            continue
+        if app.get("id") in proto_ids:
+            items = [it for it in app.get("portfolio_item_list") or [] if not _item_chain(it)]
+            if not items:
+                continue
+            app = {**app, "portfolio_item_list": items}
+        merged.append(app)
+    return merged
+
+
+def _accept_evm_positions(client: Any, address: str, proxy: str | None, shared: Memo,
+                          chain_map: dict[str, dict[str, Any]],
+                          evm_positions: dict[tuple[str, str, str], float],
+                          notes: list[str], protocols_usd: float, protocols_data: list[dict],
+                          unverified_usd: float, confirmed_keys: set) -> tuple[float, list[dict], float, bool]:
+    """Шаг 3b выборки (см. _fetch_snapshot): проверка EVM-позиций протоколов.
+
+    Подтверждённые позиции ≥ PROTOCOL_CONFIRM_MIN_USD попадают в confirmed_keys: выборка,
+    где такой позиции нет (Rabby отдал чужой список протоколов при своих
+    токенах), считается неполной и в согласии не участвует — как с токенами.
+    """
+    pos_chains = sorted({ch for _, _, ch in evm_positions})
+    active = run_parallel({ch: (lambda ch=ch: shared.get(("nonce", ch), lambda: _chain_active(
+        address, ch, chain_map, proxy))) for ch in pos_chains})
+    rejected: dict[tuple[str, str, str], str] = {}
+    for ch in pos_chains:
+        # Агрегат Rabby здесь не используется: через прокси он часто чужой и
+        # отклонял настоящие позиции (а фейк с заражённым агрегатом пропускал).
+        reason = "кошелёк не делал транзакций в этой сети" if unwrap_or_none(active[ch]) is False else ""
+        if reason:
+            for key in evm_positions:
+                if key[2] == ch:
+                    rejected[key] = reason
+
+    # (2) Подтверждение независимым запросом — крупнейшие протоколы.
+    by_proto: dict[str, float] = {}
+    for key, v in evm_positions.items():
+        if key not in rejected:
+            by_proto[key[0]] = by_proto.get(key[0], 0.0) + v
+    to_confirm = [pid for pid, v in sorted(by_proto.items(), key=lambda kv: -kv[1])
+                  if v >= PROTOCOL_CONFIRM_MIN_USD][:PROTOCOL_CONFIRM_MAX]
+    answers = run_parallel({pid: (lambda pid=pid: client.get_protocol(address, pid)) for pid in to_confirm})
+    confirmed: dict[tuple[str, str], float] = {}
+    for pid in to_confirm:
+        proto = unwrap(answers[pid])  # сбой запроса → выборка повторится
+        for item in proto.get("portfolio_item_list") or []:
+            ch = _item_chain(item)
+            if ch:
+                confirmed[(pid, ch)] = confirmed.get((pid, ch), 0.0) + _safe_position_value(item)
+    list_foreign = False
+    for key, v in evm_positions.items():
+        pid, _, ch = key
+        if key in rejected or pid not in to_confirm:
+            continue
+        # Сумма по (протокол, сеть) — у протокола может быть несколько имён позиций.
+        claimed = sum(x for k, x in evm_positions.items() if k[0] == pid and k[2] == ch)
+        got = confirmed.get((pid, ch), 0.0)
+        if not _close(claimed, got):
+            rejected[key] = f"повторный запрос протокола дал ${got:.2f}"
+            list_foreign = True
+        else:
+            if got < claimed:
+                evm_positions[key] = v * got / claimed if claimed else 0.0
+            if got >= PROTOCOL_CONFIRM_MIN_USD:
+                confirmed_keys.add(("protocol", pid, ch))
+    # Rabby подменяет ответ целиком, а не отдельные позиции: если все
+    # проверенные (крупнейшие) позиции подтвердились, список свой и хвост
+    # (мелочь и то, что не влезло в лимит запросов) принимается.
+    for key in evm_positions:
+        if key not in rejected and key[0] not in to_confirm and list_foreign:
+            rejected[key] = "список протоколов Rabby признан чужим"
+
+    for (pid, name, ch), v in evm_positions.items():
+        if (pid, name, ch) in rejected:
+            unverified_usd += v
+            if round(v, 2) >= MIN_VALUE_DISPLAY:
+                notes.append(f"{name} ({ch}) ${v:.2f} отклонена: {rejected[(pid, name, ch)]}")
+            continue
+        if round(v, 2) < MIN_VALUE_DISPLAY:
+            continue
+        protocols_usd += v
+        protocols_data.append({"name": name, "chain": ch, "value": round(v, 2)})
+    return protocols_usd, protocols_data, unverified_usd, list_foreign
+
+
+def unwrap_or_none(v: Any) -> Any:
+    return None if isinstance(v, BaseException) else v
+
+
+def _chain_active(address: str, chain: str, chain_map: dict[str, dict[str, Any]],
+                  proxy: str | None) -> bool | None:
+    """Отправлял ли адрес транзакции в сети (nonce > 0). None — сеть не
+    определена или RPC недоступен (тогда решает только сверка с агрегатом)."""
+    from app.integrations import onchain
+
+    evm = (chain_map.get(chain) or {}).get("evm")
+    if not evm:
+        return None
+    try:
+        nonce = onchain._hex_to_int(onchain.call(evm, "eth_getTransactionCount", [address.lower(), "latest"], proxy))
+    except Exception:  # noqa: BLE001
+        return None
+    return nonce > 0
+
+
 def _item_chain(item: dict) -> str:
     """Сеть позиции по токенам; '' для app-chain (Hyperliquid, Lighter, …)."""
     detail = item.get("detail") or {}
@@ -372,6 +496,8 @@ def _fetch_snapshot(address: str, proxy: str, shared: Memo | None = None,
     }
     if with_positions:
         calls["apps"] = lambda: client.get_complex_app_list(address)
+        calls["protocols"] = lambda: client.get_complex_protocol_list(address)
+        calls["simple"] = lambda: client.get_simple_protocol_list(address)
         calls["native"] = lambda: shared.get("native", lambda: _appchain_positions(address, proxy))
     r = run_parallel(calls)
     dead = next((v for v in r.values() if isinstance(v, ProxyDead)), None)
@@ -405,7 +531,7 @@ def _fetch_snapshot(address: str, proxy: str, shared: Memo | None = None,
     else:
         tokens = r["tokens"]
     tokens = [t for t in tokens if _token_ok(t)]
-    portfolio = unwrap(r["apps"]) if with_positions else []
+    portfolio = _merge_portfolio(unwrap(r["apps"]), unwrap(r["protocols"])) if with_positions else []
     native = unwrap(r["native"]) if with_positions else {}
     chain_map = r["chain_map"] or {}
 
@@ -418,6 +544,7 @@ def _fetch_snapshot(address: str, proxy: str, shared: Memo | None = None,
     unverified_usd = 0.0
     claimed_appchain: dict[str, float] = {}
     unverified_apps: dict[str, float] = {}
+    evm_positions: dict[tuple[str, str, str], float] = {}  # (id, имя, сеть) → USD, до проверки
     for proto in portfolio:
         app_id = str(proto.get("id") or "")
         items = proto.get("portfolio_item_list") or []
@@ -432,21 +559,15 @@ def _fetch_snapshot(address: str, proxy: str, shared: Memo | None = None,
 
         if not evm_items:
             continue
-        proto_value = sum(_safe_position_value(item) for item in evm_items)
-        if round(proto_value, 2) < MIN_VALUE_DISPLAY:
-            continue
-        protocols_usd += proto_value
-
-        proto_chain = ""
+        # Позиции разбиваются по сетям: каждую сеть подтверждаем отдельно (3b).
         for item in evm_items:
             ch = _item_chain(item)
-            proto_by_chain[ch] = proto_by_chain.get(ch, 0.0) + _safe_position_value(item)
-            proto_chain = proto_chain or ch
-        protocols_data.append({
-            "name": proto.get("name", "?"),
-            "chain": proto_chain or proto.get("chain", ""),
-            "value": round(proto_value, 2),
-        })
+            value = _safe_position_value(item)
+            if value <= 0:
+                continue
+            proto_by_chain[ch] = proto_by_chain.get(ch, 0.0) + value
+            key = (app_id, proto.get("name", "?"), ch)
+            evm_positions[key] = evm_positions.get(key, 0.0) + value
 
     # 2b) On-chain проверка токенов (фантомы отбрасываются, количества сверяются)
     #     и — одновременно с ней — свежий token_list по сетям, где агрегат выше
@@ -509,6 +630,35 @@ def _fetch_snapshot(address: str, proxy: str, shared: Memo | None = None,
         phantom_chains[chain] = agg_chains[chain] - by_chain.get(chain, 0.0) - proto_by_chain.get(chain, 0.0)
     tokens_usd = sum(_token_value(t) for t in tokens)
 
+    # 3b) EVM-позиции протоколов. complex_protocol_list, как и остальные
+    #     эндпоинты Rabby, в части ответов отдаёт ЧУЖОЙ портфель (одинаковые
+    #     суммы у разных кошельков; иногда вместе с заражённым агрегатом).
+    #     Позиция принимается, только если:
+    #       (1) кошелёк активен в её сети on-chain (nonce > 0);
+    #       (2) независимый запрос /v1/user/protocol по этому протоколу
+    #           вернул ту же сумму в той же сети (берётся меньшая).
+    #     Агрегат Rabby как фильтр не годится: через прокси он часто чужой.
+    #     Не подтвердилась хоть одна позиция из проверенных — весь список
+    #     считается чужим, непроверенный остаток тоже отклоняется.
+    protocols_foreign = False
+    if evm_positions:
+        protocols_usd, protocols_data, unverified_usd, protocols_foreign = _accept_evm_positions(
+            client, address, proxy, shared, chain_map, evm_positions, notes, protocols_usd, protocols_data, unverified_usd,
+            stats["confirmed"])
+    # Полнота: протокол из независимого simple_protocol_list, которого нет в
+    # complex_protocol_list, — complex пришёл чужим/пустым при своих токенах.
+    if with_positions:
+        have = {pid for pid, _, _ in evm_positions}
+        missing = sorted(
+            str(p.get("id")) for p in unwrap(r["simple"]) or []
+            if isinstance(p, dict) and str(p.get("chain") or "") in chain_map
+            and str(p.get("id")) not in APPCHAIN_NATIVE and str(p.get("id")) not in have
+            and float(p.get("net_usd_value") or 0) >= PROTOCOL_CONFIRM_MIN_USD)
+        if missing:
+            protocols_foreign = True
+            notes.append("список протоколов Rabby неполный (нет " + ", ".join(missing[:5])
+                         + ") — выборка не участвует в согласии")
+
     # 3a) App-chain: нативные API — единственный источник значений.
     if with_positions:
         for key, (label, chain) in APPCHAIN_LABELS.items():
@@ -555,6 +705,7 @@ def _fetch_snapshot(address: str, proxy: str, shared: Memo | None = None,
         "onchain_rejected_usd": round(stats["rejected_usd"], 2),
         "_rabby_tokens_usd": rabby_tokens_usd,
         "_confirmed": frozenset(stats["confirmed"]),
+        "_protocols_foreign": protocols_foreign,
     }
 
 
@@ -573,15 +724,18 @@ def _is_tainted(snap: dict[str, Any]) -> bool:
 
 
 def _eligible(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Выборки, которые могут участвовать в согласии: не заражённые и полные —
-    содержат все токены, подтверждённые на цепочке в любой выборке кошелька.
+    """Выборки, которые могут участвовать в согласии: не заражённые (чужие
+    токены или чужой список протоколов) и полные — содержат все токены и
+    позиции, подтверждённые в любой выборке кошелька.
     On-chain проверка снимает лишние токены, но пропавший из ответа Rabby
     токен можно заметить только по другим выборкам."""
+    clean = [s for s in snapshots if not _is_tainted(s) and not s.get("_protocols_foreign")]
+    # «Известное» — только из чистых выборок: заражённая могла «подтвердить»
+    # чужую позицию, и тогда все честные выборки выглядели бы неполными.
     known: set = set()
-    for s in snapshots:
+    for s in clean:
         known |= s.get("_confirmed", frozenset())
-    return [s for s in snapshots
-            if not _is_tainted(s) and known <= s.get("_confirmed", frozenset())]
+    return [s for s in clean if known <= s.get("_confirmed", frozenset())]
 
 
 def _finalize(chosen: dict[str, Any], snapshots: list[dict[str, Any]], corroborated: bool) -> dict[str, Any]:
@@ -703,7 +857,10 @@ def check_wallet(address: str, rotator: ProxyRotator, stop_event: threading.Even
                 proxy = pending.pop(fut)
                 started.pop(fut, None)
                 try:
-                    snapshots.append(fut.result())
+                    snap = fut.result()
+                    snapshots.append(snap)
+                    if not any(s is snap for s in _eligible(snapshots)):
+                        retry_after = max(retry_after, TAINTED_BACKOFF_SEC)
                 except Exception as e:  # noqa: BLE001
                     last_error = e
                     err_str = str(e).lower()
@@ -713,7 +870,7 @@ def check_wallet(address: str, rotator: ProxyRotator, stop_event: threading.Even
                         rotator.cooldown(proxy, PROXY_COOLDOWN_TIMEOUT_SEC)
                     elif _is_rate_limited(e):
                         rotator.cooldown(proxy, PROXY_COOLDOWN_429_SEC)
-                    retry_after = RETRY_PROXY_BACKOFF_SEC
+                    retry_after = max(retry_after, RETRY_PROXY_BACKOFF_SEC)
                     logger.debug("[%s] snapshot failed via %s: %s", address[:10], proxy.split("@")[-1], str(e)[:120])
 
             cluster = _largest_agreeing_cluster(_eligible(snapshots))

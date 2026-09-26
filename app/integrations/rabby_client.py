@@ -172,6 +172,34 @@ class RabbyClient:
             return apps if isinstance(apps, list) else []
         return result if isinstance(result, list) else []
 
+    def get_complex_protocol_list(self, address: str) -> list:
+        """EVM DeFi-протоколы с позициями по всем сетям (стейкинг, LP, lending…).
+
+        ``complex_app_list`` отдаёт только app-позиции (Hyperliquid и т.п.);
+        EVM-протоколы (TitanX, Aave, Pancake…) расширение Rabby грузит этим
+        эндпоинтом. Формат элементов тот же (DeBank).
+        """
+        result = self._get("/v1/user/complex_protocol_list", {"id": address.lower()})
+        return result if isinstance(result, list) else []
+
+    def get_simple_protocol_list(self, address: str) -> list:
+        """Протоколы адреса без позиций: ``[{id, chain, net_usd_value}]``.
+
+        Независимый от ``complex_protocol_list`` список — сверка полноты:
+        заражённый ответ complex бывает пустым/чужим при своих токенах.
+        """
+        result = self._get("/v1/user/simple_protocol_list", {"id": address.lower()})
+        return result if isinstance(result, list) else []
+
+    def get_protocol(self, address: str, protocol_id: str) -> dict:
+        """Позиции адреса в одном протоколе (``portfolio_item_list``).
+
+        Независимый запрос для подтверждения позиций из
+        ``complex_protocol_list``: тот отдаёт части ответов чужой портфель.
+        """
+        result = self._get("/v1/user/protocol", {"id": address.lower(), "protocol_id": protocol_id})
+        return result if isinstance(result, dict) else {}
+
     def get_chain_list(self) -> list:
         """Сети Rabby: ``id`` (строковый), ``community_id`` (EVM chain id), ``native_token_id``."""
         result = self._get("/v1/chain/list")
