@@ -67,14 +67,21 @@ def _load_spot_prices(proxy: str | None) -> dict[str, float]:
         raise HyperliquidError("spotMetaAndAssetCtxs: неожиданная схема")
     meta, ctxs = data
     tokens = {t["index"]: t["name"] for t in meta.get("tokens", [])}
+    # ctxs НЕ выровнены с universe по позиции (ctxs длиннее и идут в другом
+    # порядке) — zip() раздавал токенам цены чужих пар (спам MAX → $10 вместо
+    # $0.0000003). Сопоставляем строго по имени пары: pair.name == ctx.coin.
+    ctx_by_coin = {c.get("coin"): c for c in ctxs if isinstance(c, dict) and c.get("coin")}
     prices: dict[str, float] = {"USDC": 1.0}
-    for pair, ctx in zip(meta.get("universe", []), ctxs):
+    for pair in meta.get("universe", []):
         idx = pair.get("tokens") or []
         if len(idx) != 2 or idx[1] != 0:  # котировка не в USDC
             continue
         base = tokens.get(idx[0])
+        ctx = ctx_by_coin.get(pair.get("name"))
+        if not base or ctx is None:
+            continue
         px = ctx.get("midPx") or ctx.get("markPx")
-        if base and px is not None:
+        if px is not None:
             try:
                 prices.setdefault(base, float(px))
             except (TypeError, ValueError):

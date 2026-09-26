@@ -6,6 +6,20 @@
 
 ## Русский
 
+### Версия 1.1.1 — 26.09.2026
+
+#### EVM Balance Checker — исправления
+- Исправлены **завышенные балансы Hyperliquid**: спам-токены получали цену чужой пары
+  (кошелёк с $0.35 показывал $4.6M).
+- Теперь учитываются **DeFi-позиции в EVM-сетях** — стейкинг, лендинг, пулы ликвидности
+  (TitanX, Recall, Aave, Pendle и др.). Раньше они не попадали в итог.
+- Каждая DeFi-позиция **подтверждается повторно**: чужие позиции, которые Rabby иногда
+  подставляет, отбрасываются.
+- Заметно меньше статусов `unverified` и ошибок: неподтверждённые кошельки
+  автоматически перепроверяются через 30 секунд.
+- Скорость проверки подобрана под лимиты Rabby — без ошибок 429
+  (около 1 кошелька одновременно на 3 прокси).
+
 ### Версия 1.1.0 — 24.09.2026
 
 #### EVM Balance Checker — только честные балансы
@@ -66,6 +80,20 @@ pip install -r requirements.txt
 ---
 
 ## English
+
+### Version 1.1.1 — 26.09.2026
+
+#### EVM Balance Checker — fixes
+- Fixed **inflated Hyperliquid balances**: spam tokens were priced by another trading
+  pair (a $0.35 wallet showed $4.6M).
+- **DeFi positions on EVM chains** are now counted — staking, lending, liquidity pools
+  (TitanX, Recall, Aave, Pendle and more). Previously they were missing from the total.
+- Every DeFi position is **double-checked**: foreign positions that Rabby sometimes
+  returns are dropped.
+- Far fewer `unverified` statuses and errors: unconfirmed wallets are rechecked
+  automatically after 30 seconds.
+- Check speed is tuned to Rabby limits — no 429 errors
+  (about 1 wallet at a time per 3 proxies).
 
 ### Version 1.1.0 — 24.09.2026
 
