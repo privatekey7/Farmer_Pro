@@ -15,6 +15,17 @@ requirements-dev.txt
 CHANGELOG_DEV.md
 _gitbook_update/
 
+# User data: wallets, proxies (with credentials), results, keys
+*.xlsx
+*.xls
+*.csv
+*proxies*.txt
+*proxy*.txt
+Address_*.txt
+*wallets*.txt
+*keys*.txt
+.env
+
 # OS / IDE
 .DS_Store
 Thumbs.db

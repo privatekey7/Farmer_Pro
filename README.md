@@ -18,6 +18,11 @@ A modular desktop tool for managing crypto accounts and wallets.
 | Twitter Checker | Check Twitter/X account status |
 | Discord Token Checker | Check Discord token status |
 
+### What's new in v1.1.1 (26.09.2026)
+
+- **EVM Balance** — fixed inflated Hyperliquid balances; DeFi positions on EVM chains (staking, lending, pools)
+  are now counted and double-checked; far fewer `unverified` and errors.
+
 ### What's new in v1.1.0 (24.09.2026)
 
 - **EVM Balance** — balances are double-checked on-chain, no more fake or inflated totals. New `unverified` status.
@@ -60,6 +65,11 @@ For detailed documentation visit: https://privatekey7.gitbook.io/farmerpro-en/
 | Proxy Checker | Проверка работоспособности прокси |
 | Twitter Checker | Проверка статуса Twitter/X аккаунтов |
 | Discord Token Checker | Проверка статуса Discord токенов |
+
+### Что нового в v1.1.1 (26.09.2026)
+
+- **EVM Balance** — исправлены завышенные балансы Hyperliquid; DeFi-позиции в EVM-сетях (стейкинг, лендинг, пулы)
+  теперь учитываются и перепроверяются; заметно меньше `unverified` и ошибок.
 
 ### Что нового в v1.1.0 (24.09.2026)
 

@@ -16,6 +16,11 @@ from app.integrations.proxy_utils import ProxyRotator
 # только из проверенных компонентов, агрегат Rabby — лишь контроль, баланс
 # принимается при согласии двух независимых выборок, иначе UNVERIFIED.
 
+# UNVERIFIED/ERROR перепроверяются позже: заражение Rabby «залипает» на
+# адресе на десятки секунд, и через паузу кошелёк обычно проверяется чисто.
+RECHECK_ROUNDS = 2
+RECHECK_DELAY_SEC = 30
+
 _STATUS = {
     "OK": ResultStatus.OK,
     "UNVERIFIED": ResultStatus.UNVERIFIED,
@@ -122,18 +127,34 @@ class EvmBalanceCheckerModule(BaseModule):
         # дефолтный executor (max ~12-32 потока), и он был узким горлышком
         # независимо от ctx.concurrency. Теперь пул сразу под нужный размер.
         concurrency = max(1, min(int(ctx.concurrency or 16), 200, max(1, len(wallets))))
+        # Каждый кошелёк держит в полёте 2+ выборки через разные прокси, каждая —
+        # 5–15 запросов к Rabby. Замер на 100 прокси: 30 кошельков одновременно —
+        # без 429 и с минимумом UNVERIFIED; 60 — почти не быстрее, UNVERIFIED
+        # вдвое больше. Поэтому не больше ~1 кошелька на 3 прокси.
+        if proxies:
+            concurrency = min(concurrency, max(4, len(proxies) // 3))
         semaphore = asyncio.Semaphore(concurrency)
         loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="evm-wallet")
 
         async def _indexed_check(idx: int, addr: str) -> tuple[int, Result]:
-            async with semaphore:
-                if self._stop_event.is_set():
-                    return idx, Result(item=addr, status=ResultStatus.ERROR, error="Stopped")
-                result = await loop.run_in_executor(
-                    executor, _check_wallet_sync, addr, rotator, self._stop_event
-                )
-                return idx, result
+            result = Result(item=addr, status=ResultStatus.ERROR, error="Stopped")
+            for attempt in range(RECHECK_ROUNDS + 1):
+                if attempt:
+                    # Пауза вне семафора: слот занимают другие кошельки.
+                    for _ in range(int(RECHECK_DELAY_SEC * 2)):
+                        if self._stop_event.is_set():
+                            return idx, result
+                        await asyncio.sleep(0.5)
+                async with semaphore:
+                    if self._stop_event.is_set():
+                        return idx, result
+                    result = await loop.run_in_executor(
+                        executor, _check_wallet_sync, addr, rotator, self._stop_event
+                    )
+                if result.status not in (ResultStatus.UNVERIFIED, ResultStatus.ERROR) or rotator.is_empty():
+                    break
+            return idx, result
 
         tasks = [asyncio.create_task(_indexed_check(i, addr)) for i, addr in enumerate(wallets)]
         buffer: dict[int, Result] = {}
